@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: trinetra-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PROVIDER
+        value: yahooDelayed
+      - key: REFRESH_MS
+        value: "60000"

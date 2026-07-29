@@ -1,0 +1,13 @@
+{
+  "_comment": "Fundamentals change quarterly. Maintain from screener.in (free). roe %, de ratio, profitGrowth % 3y CAGR, promoter %, pledged %. Symbols missing here fail the Fundamentals criterion (safe default).",
+  "POLYCAB":   { "roe": 22.4, "de": 0.05, "profitGrowth": 28, "promoter": 65.2, "pledged": 0 },
+  "KAYNES":    { "roe": 16.8, "de": 0.21, "profitGrowth": 44, "promoter": 57.8, "pledged": 0 },
+  "MAZDOCK":   { "roe": 31.2, "de": 0.02, "profitGrowth": 38, "promoter": 84.8, "pledged": 0 },
+  "BEL":       { "roe": 24.6, "de": 0.01, "profitGrowth": 22, "promoter": 51.1, "pledged": 0 },
+  "HAL":       { "roe": 27.3, "de": 0.03, "profitGrowth": 26, "promoter": 71.6, "pledged": 0 },
+  "JYOTICNC":  { "roe": 18.6, "de": 0.36, "profitGrowth": 49, "promoter": 66.7, "pledged": 0 },
+  "NETWEB":    { "roe": 24.4, "de": 0.08, "profitGrowth": 55, "promoter": 74.4, "pledged": 0 },
+  "CDSL":      { "roe": 26.9, "de": 0.00, "profitGrowth": 25, "promoter": 15.0, "pledged": 0 },
+  "DIXON":     { "roe": 21.7, "de": 0.18, "profitGrowth": 52, "promoter": 32.9, "pledged": 0 },
+  "CGPOWER":   { "roe": 28.9, "de": 0.03, "profitGrowth": 35, "promoter": 58.1, "pledged": 0 }
+}

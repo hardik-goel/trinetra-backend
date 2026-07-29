@@ -1,0 +1,106 @@
+{
+  "criteria": [
+    {
+      "id": "fund",
+      "key": "F",
+      "name": "Fundamentals",
+      "enabled": true,
+      "builtin": true,
+      "checks": [
+        {
+          "metric": "roe",
+          "op": "gte",
+          "value": 15
+        },
+        {
+          "metric": "de",
+          "op": "lte",
+          "value": 0.7
+        },
+        {
+          "metric": "profitGrowth",
+          "op": "gte",
+          "value": 12
+        },
+        {
+          "metric": "promoter",
+          "op": "gte",
+          "value": 40
+        }
+      ]
+    },
+    {
+      "id": "brk",
+      "key": "B",
+      "name": "Breakout",
+      "enabled": true,
+      "builtin": true,
+      "checks": [
+        {
+          "metric": "aboveHigh20",
+          "op": "gte",
+          "value": 1
+        },
+        {
+          "metric": "dayChgPct",
+          "op": "gte",
+          "value": 2
+        },
+        {
+          "metric": "pctOf52wHigh",
+          "op": "gte",
+          "value": 95
+        }
+      ]
+    },
+    {
+      "id": "vol",
+      "key": "V",
+      "name": "Volume shocker",
+      "enabled": true,
+      "builtin": true,
+      "checks": [
+        {
+          "metric": "volMultiple",
+          "op": "gte",
+          "value": 3
+        }
+      ]
+    },
+    {
+      "id": "flow",
+      "key": "O",
+      "name": "Order flow",
+      "enabled": false,
+      "builtin": true,
+      "checks": [
+        {
+          "metric": "buyerPct",
+          "op": "gte",
+          "value": 65
+        }
+      ]
+    },
+    {
+      "id": "kron",
+      "key": "K",
+      "name": "AI Forecast (Kronos)",
+      "enabled": false,
+      "builtin": true,
+      "checks": [
+        {
+          "metric": "fcstReturn",
+          "op": "gte",
+          "value": 2
+        }
+      ]
+    }
+  ],
+  "alerts": {
+    "telegram": {
+      "on": false,
+      "token": "",
+      "chatId": ""
+    }
+  }
+}

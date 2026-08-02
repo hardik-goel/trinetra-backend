@@ -95,19 +95,44 @@ const fundInflight = new Set();
 // then goes quiet.
 const isStale = rec => METRIC_KEYS.some(k => !(k in rec));
 
+// Queued and paced, for the same reason /fundamentals/refresh-all is: a burst
+// of parallel scrapes is how you get blocked. One stale symbol is a trickle,
+// but a catalog change marks the whole universe stale at once — on a 22-name
+// list that would be ~44 requests across two sites in the same second.
+const fundQueue = [];
+let fundDraining = false;
+const FUND_GAP_MS = 1_000;
+
 // Fire-and-forget: adding a symbol must not wait on a scrape.
 function ensureFundamentals(symbols) {
   for (const s of symbols) {
-    if ((fundCache[s] && !isStale(fundCache[s])) || fundInflight.has(s)) continue;
-    fundInflight.add(s);
-    fetchFundamentals(s)
-      .then(rec => {
+    if ((fundCache[s] && !isStale(fundCache[s])) || fundInflight.has(s) || fundQueue.includes(s)) continue;
+    fundQueue.push(s);
+  }
+  drainFundQueue(); // deliberately not awaited
+}
+
+async function drainFundQueue() {
+  if (fundDraining) return;
+  fundDraining = true;
+  try {
+    while (fundQueue.length) {
+      const s = fundQueue.shift();
+      fundInflight.add(s);
+      try {
+        const rec = await fetchFundamentals(s);
         fundCache[s] = strip(rec); saveFundCache();
         applyFund([s]);
         console.log(`[fundamentals] ${s}: ${rec.status}${rec.source ? " via " + rec.source : ""}${rec.missing.length ? " · missing " + rec.missing.join(",") : ""}`);
-      })
-      .catch(e => console.warn(`[fundamentals] ${s}: ${e.message}`))
-      .finally(() => fundInflight.delete(s));
+      } catch (e) {
+        console.warn(`[fundamentals] ${s}: ${e.message}`);
+      } finally {
+        fundInflight.delete(s);
+      }
+      if (fundQueue.length) await new Promise(r => setTimeout(r, FUND_GAP_MS));
+    }
+  } finally {
+    fundDraining = false;
   }
 }
 

@@ -26,6 +26,7 @@ import { notify } from "./lib/alerts.js";
 import { getForecasts, mergeForecasts } from "./lib/oracle.js";
 import { startKeepAlive } from "./lib/keepalive.js";
 import { fetchFundamentals } from "./lib/fundamentals.js";
+import { METRIC_KEYS } from "./fundamentals.config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = f => JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8"));
@@ -62,7 +63,7 @@ const saveUniverse = () => { try { fs.writeFileSync(UNIVERSE_PATH, JSON.stringif
 // fundamentals.json stays as the durable seed underneath — same ephemeral
 // caveat as the universe on Render free.
 const FUND_CACHE_PATH = path.join(__dirname, "fundamentals.cache.json");
-const FUND_FIELDS = ["roe", "de", "profitGrowth", "promoter", "pledged"];
+const FUND_FIELDS = METRIC_KEYS; // the catalog decides, not this file
 let fundCache = fs.existsSync(FUND_CACHE_PATH) ? read("fundamentals.cache.json") : {};
 const saveFundCache = () => { try { fs.writeFileSync(FUND_CACHE_PATH, JSON.stringify(fundCache, null, 2)); } catch {} };
 
@@ -79,12 +80,25 @@ const fundFor = sym => {
   return { ...merged, status: cached.status, source: cached.source, fetchedAt: cached.fetchedAt };
 };
 
-const strip = r => ({ roe: r.roe, de: r.de, profitGrowth: r.profitGrowth, promoter: r.promoter, pledged: r.pledged, status: r.status, source: r.source, fetchedAt: r.fetchedAt });
+// Cache only the metric values plus provenance — `missing` is derivable.
+const strip = r => ({
+  ...Object.fromEntries(METRIC_KEYS.map(k => [k, r[k] ?? null])),
+  status: r.status, source: r.source, fetchedAt: r.fetchedAt,
+});
 const fundInflight = new Set();
+
+// A record written before a metric was added to the catalog simply lacks that
+// key — and would otherwise be cached forever, so every criterion on the new
+// metric reads "no data" for as long as the cache survives. An ABSENT key means
+// never scraped for it; a present null means scraped and genuinely unavailable.
+// Only the former is stale, so this re-scrapes once after a catalog change and
+// then goes quiet.
+const isStale = rec => METRIC_KEYS.some(k => !(k in rec));
+
 // Fire-and-forget: adding a symbol must not wait on a scrape.
 function ensureFundamentals(symbols) {
   for (const s of symbols) {
-    if (fundCache[s] || fundInflight.has(s)) continue;
+    if ((fundCache[s] && !isStale(fundCache[s])) || fundInflight.has(s)) continue;
     fundInflight.add(s);
     fetchFundamentals(s)
       .then(rec => {

@@ -127,6 +127,55 @@ status shown next to them.
 | POST | /fundamentals/refresh | `{ symbol }` → re-scrape one, return the record |
 | POST | /fundamentals/refresh-all | re-scrape the universe, paced ~1s apart → `{ refreshed, partial, unavailable }` |
 
+### The metric catalog
+Every metric is one entry in `fundamentals.config.js`. Nothing else in the
+codebase enumerates metric keys — the scraper, the plausibility guard, the
+cache, the API and the criteria engine all read that file.
+
+| key | metric | unit | required | where it comes from |
+|-----|--------|------|----------|---------------------|
+| `roe` | Return on equity | % | yes | screener tile → moneycontrol |
+| `roce` | Return on capital employed | % | yes | screener tile |
+| `de` | Debt / equity | — | yes | derived: borrowings ÷ net worth → moneycontrol |
+| `pe` | Price / earnings | — | yes | screener tile |
+| `pb` | Price / book | — | yes | derived: current price ÷ book value |
+| `dividendYield` | Dividend yield | % | yes | screener tile |
+| `opm` | Operating margin | % | yes | screener P&L row |
+| `profitGrowth` | Profit growth (3y) | % | yes | screener growth table → moneycontrol CAGR |
+| `salesGrowth3y` | Sales growth (3y) | % | yes | screener growth table |
+| `promoter` | Promoter holding | % | yes | screener shareholding → moneycontrol |
+| `epsGrowth3y` | EPS growth (3y) | % | no | derived: 3y CAGR of the EPS row |
+| `pledged` | Pledged shares | % | no | screener analysis note → moneycontrol |
+| `piotroski` | Piotroski F-score | — | no | screener tile, only if present |
+
+**Adding a metric** is one entry in `METRICS`: `key`, `label`, `unit`, a
+plausibility `range`, `required`, and how to read it. Most need no new parsing
+code — pick an extraction kind: `topRatio` (a tile), `plRow` / `shpRow` (last
+column of a statement row), `growth` + `period` (a compounded-growth cell),
+`bullet` (a number called out in the analysis notes), or `derive(ctx)` for
+anything computed. It becomes scrapeable, cached, API-exposed and selectable as
+a criteria check with no other edit. The dashboard needs the same one-line entry
+in its `FUND_METRICS` map so the criteria builder can offer it.
+
+**Required vs optional.** `status` is judged on the required metrics only.
+Optional ones are still reported in `missing`, but a source legitimately not
+publishing something — pledging when there is none, a Piotroski score nobody
+added to the page — is not a failed scrape and shouldn't drag every stock to
+`partial`.
+
+**Piotroski is parsed, never computed.** screener.in does not ship it; it shows
+up only when the page owner has added it as a custom ratio, and it is read when
+present. It is deliberately *not* derived: a faithful F-score needs nine signals
+across two years, and screener's condensed statements do not expose the
+current-ratio and gross-margin inputs cleanly. A six-of-nine approximation
+carrying the name "Piotroski" would read as the real thing. A true F-score needs
+a dedicated financials pull — that is the work, and it hasn't been done.
+
+**Banks and NBFCs degrade to `partial`, correctly.** They publish Financing
+Margin rather than OPM, and a professionally-managed bank has no promoter row at
+all. Those metrics stay missing rather than being mapped onto a near-neighbour,
+so a bank simply never locks a criterion that cannot be evaluated for it.
+
 **Sources**, tried in order until one is complete: **screener.in** (ROE, promoter
 holding, 3-yr compounded profit growth; D/E derived from Borrowings ÷ net worth;
 pledged only when the page calls it out) then **moneycontrol** (ROE, D/E and

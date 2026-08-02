@@ -401,6 +401,9 @@ function scan() {
       }
     }
     s.profileResults = results;
+    // Flat list of the profiles this symbol currently satisfies — an "All
+    // profiles" view needs this and nothing else.
+    s.profilesLocked = Object.entries(results).filter(([, r]) => r.locked).map(([id]) => id);
   }
   scanExits();
 }
@@ -742,7 +745,37 @@ app.get("/sizing", (req, res) => {
 app.get("/concentration", (_, res) =>
   res.json(computeConcentration(holdings.open(), stockBySymbol(), config.sizing)));
 
-app.get("/events", (_, res) => res.json({ events: events.all() }));
+app.get("/events", (_, res) => res.json(events.allWithHealth()));
+
+/* Aliases matching the dashboard's contract, so neither side has to rename a
+   route it has already built against. Same handlers, different doors. */
+app.post("/profiles/:id/criteria", (req, res) => {
+  const p = config.profiles[cleanId(req.params.id)];
+  if (!p) return res.status(404).json({ error: "no such profile" });
+  if (!Array.isArray(req.body?.criteria)) return res.status(400).json({ error: "criteria must be an array" });
+  p.criteria = req.body.criteria;
+  saveConfig(); scan();
+  res.json({ profiles: config.profiles });
+});
+
+app.post("/holdings/:id/dismiss", (req, res) => {
+  const h = holdings.find(req.params.id);
+  if (!h) return res.status(404).json({ error: "no such holding" });
+  const rule = String(req.body?.rule ?? "").trim();
+  if (!rule) return res.status(400).json({ error: "rule required" });
+  const next = [...new Set([...(h.rulesDisabled || []), rule])];
+  holdings.update(h.id, { rulesDisabled: next });
+  scanExits();
+  res.json({ ok: true, rulesDisabled: next });
+});
+
+app.get("/settings/sizing", (_, res) => res.json(config.sizing));
+app.post("/settings/sizing", (req, res) => {
+  for (const k of ["capital", "riskPerTradePct", "defaultStopPct", "sectorLimitPct"])
+    if (req.body?.[k] !== undefined) config.sizing[k] = +req.body[k];
+  saveConfig();
+  res.json(config.sizing);
+});
 
 /* ── morning brief ───────────────────────────────────────────────────────── */
 

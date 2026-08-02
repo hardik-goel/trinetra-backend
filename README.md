@@ -176,8 +176,15 @@ now derives `prevClose` from the daily series and clamps implausible (>25%) day
 moves to avoid false signals. Real live day-change requires the Kite provider.
 
 ## Providers (env `PROVIDER`)
-- **stooqEod** (default) — free EOD NSE data, most reliable, no key.
 - **yahooDelayed** — free ~15-min delayed; sometimes rate-limited (HTTP 403).
+  **Use this.** It is what a working deployment currently runs on.
+- **stooqEod** — the code default, and currently **broken**: Stooq serves a
+  bot-check page instead of CSV, so every symbol returns "no data" and the scan
+  set comes back empty. Verified on 2 Aug 2026 — a local run on this default
+  logged `[stooqEod] POLYCAB: no data` for all 3 symbols and reported
+  `0 symbols via stooqEod`. Set `PROVIDER=yahooDelayed` until the source is
+  fixed; the code default is left alone so nobody's deployment changes under them
+  without an env edit.
 - **kite** — Zerodha Kite Connect (₹2,000/mo). LIVE ticks + real order-book
   depth → turns on the 4th criterion (buyers/sellers %) and drops latency to
   1–3s. Follow `providers/kite.js`, then set `PROVIDER=kite`.

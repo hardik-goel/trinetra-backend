@@ -343,6 +343,33 @@ function triggerFor(stock, profile) {
   }
 }
 
+/* Sortable summary: the four numbers a watchlist column needs, and nothing
+   else. Cached per refresh — the analog scan is cheap but not free, and it
+   would otherwise run once per profile per symbol per request. */
+const decisionCache = new Map();
+function decisionSummary(stock, profile, result) {
+  const key = `${stock.symbol}:${profile.horizon}:${snapshot.at}`;
+  if (decisionCache.has(key)) return decisionCache.get(key);
+  if (decisionCache.size > 2000) decisionCache.clear();
+
+  const ev = { criteria: result?.criteria || [] };
+  const { potential: pot, confidence: conf, exits } = analyse(stock, profile, ev);
+  const summary = {
+    profileId: profile.horizon,
+    confidence: conf ? { score: conf.score, band: conf.band, capped: (conf.caps || []).length > 0 } : null,
+    // null rather than 0 when there is no estimate: "no view" and "no upside
+    // left" are different claims and must sort differently.
+    remainingMedianPct: pot?.remainingPct?.median ?? null,
+    rrToPrimary: exits?.riskReward?.toPrimary ?? null,
+    exhausted: !!pot?.exhausted,
+    insufficientHistory: !!pot?.insufficientHistory,
+    noEstimate: pot === null,
+    analogsN: pot?.analogs?.n ?? null,
+  };
+  decisionCache.set(key, summary);
+  return summary;
+}
+
 /** Everything A8 produces for one stock under one profile. */
 function analyse(stock, profile, ev) {
   const pot = potential(stock, { horizon: profile.horizon, triggerPrice: triggerFor(stock, profile) });
@@ -404,6 +431,17 @@ function scan() {
     // Flat list of the profiles this symbol currently satisfies — an "All
     // profiles" view needs this and nothing else.
     s.profilesLocked = Object.entries(results).filter(([, r]) => r.locked).map(([id]) => id);
+
+    /* Compact decision summary per profile, so the watchlist can sort by
+       confidence, remaining potential or risk-reward without a call per row.
+       Deliberately NOT the full payload: the components, rationale and analog
+       detail are heavy and only wanted when a row is opened, which is what
+       /decision serves. */
+    s.decisions = {};
+    for (const [id, profile] of active) {
+      const d = decisionSummary(s, profile, results[id]);
+      if (d) s.decisions[id] = d;
+    }
   }
   scanExits();
 }
@@ -723,8 +761,17 @@ app.patch("/holdings/:id", (req, res) => {
 app.delete("/holdings/:id", (req, res) =>
   holdings.remove(req.params.id) ? res.json({ ok: true }) : res.status(404).json({ error: "no such holding" }));
 
+/* `signals` is fired-only. Armed-but-unfired rules are a separate array, so a
+   "trailing stop 1.2% away" can never be rendered with the same affordances as
+   a rule that actually broke — the client should not have to remember to split
+   on a flag to avoid offering "Mark closed" on a watch. */
 app.get("/exit-signals", (_, res) =>
-  res.json({ signals: activeExits, rules: config.exitRules, dataAge: dataAge() }));
+  res.json({
+    signals: activeExits.filter(e => e.fired !== false),
+    armed: activeExits.filter(e => e.fired === false),
+    rules: config.exitRules,
+    dataAge: dataAge(),
+  }));
 
 /* ── sizing & concentration ──────────────────────────────────────────────── */
 
@@ -767,6 +814,34 @@ app.post("/holdings/:id/dismiss", (req, res) => {
   holdings.update(h.id, { rulesDisabled: next });
   scanExits();
   res.json({ ok: true, rulesDisabled: next });
+});
+
+/* The full decision surface for one symbol under one profile — what the detail
+   drawer needs. Computed on demand rather than shipped for every row, since the
+   components, rationale and analog detail are only wanted once something is
+   opened. Works whether or not the profile is currently locked: the user asking
+   "what would this be worth" deserves an answer before it fires. */
+app.get("/decision", (req, res) => {
+  const sym = String(req.query.symbol ?? "").trim().toUpperCase();
+  const stock = stockBySymbol()[sym];
+  if (!stock) return res.status(404).json({ error: "symbol not in the current snapshot" });
+  const id = cleanId(req.query.profile || "swing");
+  const profile = config.profiles[id];
+  if (!profile) return res.status(404).json({ error: "no such profile" });
+
+  const ev = evaluate(stock, profile.criteria);
+  const { potential: pot, confidence: conf, exits } = analyse(stock, profile, ev);
+  res.json({
+    symbol: sym, profileId: id, profileName: profile.name, horizon: profile.horizon,
+    price: stock.price,
+    locked: ev.locked, count: ev.count, total: ev.total, criteria: ev.criteria,
+    potential: pot, confidence: conf, exits,
+    nextEvent: stock.nextEvent,
+    dataAge: dataAge(),
+    lagDisclosure: profile.horizon === "intraday" && FEED_DELAYED
+      ? `Prices are ~${Math.round((PROVIDER_LAG_S[PROVIDER] ?? 900) / 60)} minutes delayed. This stock has already moved ${pot?.movedAlreadyPct >= 0 ? "+" : ""}${pot?.movedAlreadyPct ?? 0}% since the trigger level; the estimate below is what may remain, not the full move.`
+      : null,
+  });
 });
 
 app.get("/settings/sizing", (_, res) => res.json(config.sizing));

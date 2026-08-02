@@ -315,3 +315,50 @@ brief is still sent — silence means breakage, never emptiness.
 ### `GET /events`
 `{ events: { SYMBOL: { checkedAt, events: [ { type, date } ] } } }`. Absent means
 "could not establish", never "no event" — do not render absence as safety.
+
+---
+
+## Decision data for lists and drawers (added after the dashboard's first bind)
+
+### `/snapshot` rows — `decisions`
+Compact and sortable, one entry per enabled profile. Deliberately not the full
+payload: components, rationale and analog detail are heavy and only wanted when
+a row is opened.
+
+```json
+"decisions": { "swing": { "profileId": "swing",
+                          "confidence": { "score": 65, "band": "moderate", "capped": true },
+                          "remainingMedianPct": 0.76, "rrToPrimary": 0.2,
+                          "exhausted": false, "insufficientHistory": false,
+                          "noEstimate": false, "analogsN": 10 } }
+```
+
+Sort the watchlist on `confidence.score`, `remainingMedianPct` or `rrToPrimary`
+directly. Three null cases that must sort and render differently — they are not
+interchangeable:
+
+- `noEstimate: true` — long term, which carries no move estimate by design.
+- `insufficientHistory: true` — fewer than 8 analogs, so no range exists.
+- `remainingMedianPct: 0` with `exhausted: true` — a range exists and it is spent.
+
+`null` means "no view", never "no upside".
+
+### `GET /decision?symbol=&profile=`
+The full surface for the detail drawer: `potential`, `confidence` (with
+components and caps), `exits` (with rationale per rung and `riskReward`),
+`criteria`, `nextEvent`, `dataAge`, and `lagDisclosure` on intraday. Works
+whether or not the profile is currently locked — asking "what would this be
+worth" deserves an answer before it fires.
+
+### `GET /exit-signals` — fired and armed are separate arrays
+```json
+{ "signals": [ …rules that FIRED… ], "armed": [ …rules that have not… ],
+  "rules": {...}, "dataAge": {...} }
+```
+`signals` is fired-only. Armed entries carry `distanceToTriggerPct` and
+`action: "watch"`, so "trailing stop 2% away" cannot be rendered with the same
+affordances as a rule that actually broke.
+
+### `nextEvent` is already on every `/snapshot` row
+`{ type, date, daysAway, sessionsAway, source, fetchedAt, stale }` — no
+companion `/events` call needed for a row chip.

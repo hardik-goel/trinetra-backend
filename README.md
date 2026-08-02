@@ -242,9 +242,42 @@ everywhere — a 100% win rate over two signals is not a track record.
 
 > **These records do not survive a redeploy on Render's free tier.** They live in
 > `data/`, on the same ephemeral disk as the fundamentals cache, so a deploy
-> starts your track record from nothing. That defeats the entire purpose of
-> measuring over months. Attach a Render persistent disk mounted at `data/`, or
-> copy the files off before deploying.
+> starts your track record — and your open positions — from nothing. A persistent
+> disk mounted at `data/` is the real fix, but it is a paid feature. On free tier,
+> use backup/restore below before every deploy.
+
+## Backup and restore (the free-tier substitute for a disk)
+```bash
+# before deploying
+curl -s https://your-backend.onrender.com/backup > trinetra-backup.json
+
+# after the deploy comes up
+curl -s -X POST https://your-backend.onrender.com/restore \
+     -H 'Content-Type: application/json' \
+     --data-binary @<(jq '. + {confirm:true}' trinetra-backup.json)
+```
+
+`GET /backup` returns one file containing signal history, paper trades, IPO
+applications, holdings, the events cache, your watchlist groups, and the tuned
+config — profiles, thresholds, sizing and exit rules.
+
+**Telegram credentials are deliberately excluded.** The backup travels over HTTP
+and lands in a file that will sit around on a laptop; a bot token belongs in
+neither, and it comes from the environment anyway. A restore merges rather than
+replaces config, so the live credentials survive it.
+
+`POST /restore` requires `confirm: true` — it overwrites records that cannot be
+reconstructed, and that should take an explicit act rather than an accidental
+request. Before writing anything it saves what was already there to
+`data/pre-restore.json`, so restoring the wrong file is itself recoverable. Only
+the known filenames are written; a path in the payload is ignored rather than
+trusted. Modules re-read from disk afterwards, so the running process serves the
+restored records instead of the ones it was holding in memory.
+
+Verified end to end: state created, backed up, `data/` wiped and the process
+restarted the way a deploy does, then restored — holdings, paper trades,
+watchlists and the frozen entry criteria all came back, and the env-supplied
+Telegram credentials were untouched.
 
 ### `PRAVESH_DATA_URL` — required for the IPO opportunity-cost number
 `/ipo-applications/stats` reports what the engine's own positive calls returned on

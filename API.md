@@ -362,3 +362,19 @@ affordances as a rule that actually broke.
 ### `nextEvent` is already on every `/snapshot` row
 `{ type, date, daysAway, sessionsAway, source, fetchedAt, stale }` — no
 companion `/events` call needed for a row chip.
+
+### `GET /backup` · `POST /restore`
+Free-tier substitute for a persistent disk. `/backup` returns one JSON with
+signal history, paper trades, IPO applications, holdings, the events cache,
+watchlist groups and the tuned config (profiles, thresholds, sizing, exit rules).
+
+**Telegram credentials are excluded on purpose** — the file travels over HTTP and
+gets kept on disk. A restore merges config rather than replacing it, so live
+credentials survive.
+
+`POST /restore` needs `confirm: true`, saves the current state to
+`data/pre-restore.json` first, ignores any filename it does not recognise, and
+reloads every module from disk so the process stops serving stale records.
+
+If the dashboard surfaces this, it is a settings-panel action, not a routine
+one: "Download backup" before a deploy, "Restore from file" after.

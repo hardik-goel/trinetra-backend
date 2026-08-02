@@ -852,6 +852,96 @@ app.post("/settings/sizing", (req, res) => {
   res.json(config.sizing);
 });
 
+/* ── backup & restore ─────────────────────────────────────────────────────
+   Render's free tier has no persistent disk, so every deploy wipes data/ —
+   which now holds open positions, not just history. These two endpoints are the
+   free-tier substitute: pull one file before deploying, push it back after.
+
+   Credentials are deliberately excluded. The backup travels over HTTP and lands
+   in a file the user will keep lying around; a Telegram bot token has no
+   business in either, and it comes from the environment anyway. */
+
+const BACKUP_FILES = [
+  "signal_history.json", "paper_trades.json", "ipo_applications.json",
+  "holdings.json", "events.json",
+];
+const DATA_DIR = path.join(__dirname, "data");
+
+const readDataFile = f => {
+  try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), "utf8")); }
+  catch { return null; }
+};
+
+app.get("/backup", (_, res) => {
+  const files = {};
+  for (const f of BACKUP_FILES) {
+    const data = readDataFile(f);
+    if (data !== null) files[f] = data;
+  }
+  // Config without the secrets: profiles, thresholds, sizing and the exit rules
+  // are all hand-tuned and worth keeping; the token is not.
+  const { alerts, ...safeConfig } = config;
+  res.json({
+    backupVersion: 1,
+    generatedAt: Date.now(),
+    generatedAtIso: new Date().toISOString(),
+    counts: Object.fromEntries(Object.entries(files).map(([f, d]) => [f, Array.isArray(d) ? d.length : Object.keys(d || {}).length])),
+    files,
+    config: { ...safeConfig, alerts: { telegram: { on: !!config.alerts?.telegram?.on } } },
+    universe: { groups: GROUPS },
+    note: "Telegram credentials are excluded on purpose — they come from the environment and do not belong in a file you keep on disk.",
+  });
+});
+
+app.post("/restore", (req, res) => {
+  const body = req.body || {};
+  if (body.backupVersion !== 1) return res.status(400).json({ error: "unrecognised or missing backupVersion" });
+  // Restoring overwrites records that cannot be reconstructed, so it takes an
+  // explicit acknowledgement rather than happening because a request arrived.
+  if (body.confirm !== true) return res.status(400).json({ error: "set confirm: true — this overwrites existing records" });
+
+  // Snapshot what is there first. A restore from the wrong file is recoverable
+  // only if the thing it replaced still exists somewhere.
+  const rollback = { backupVersion: 1, generatedAt: Date.now(), files: {} };
+  for (const f of BACKUP_FILES) {
+    const cur = readDataFile(f);
+    if (cur !== null) rollback.files[f] = cur;
+  }
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+  try { fs.writeFileSync(path.join(DATA_DIR, "pre-restore.json"), JSON.stringify(rollback, null, 2)); } catch {}
+
+  const restored = {};
+  for (const [f, data] of Object.entries(body.files || {})) {
+    if (!BACKUP_FILES.includes(f)) continue; // never write a path the caller named
+    try {
+      fs.writeFileSync(path.join(DATA_DIR, f), JSON.stringify(data, null, 2));
+      restored[f] = Array.isArray(data) ? data.length : Object.keys(data || {}).length;
+    } catch (e) {
+      console.warn(`[restore] ${f}: ${e.message}`);
+    }
+  }
+
+  // Re-read, or the process would keep serving what it was holding in memory.
+  history.reload(); paper.reload(); ipo.reload(); holdings.reload();
+
+  if (body.universe?.groups && typeof body.universe.groups === "object") {
+    GROUPS = migrateGroups({ groups: body.universe.groups }, cleanSymbols);
+    commitGroups(false);
+  }
+  if (body.config) {
+    // Merge, never replace: the live Telegram credentials are not in the backup
+    // and must survive it.
+    const { alerts: _ignored, ...rest } = body.config;
+    config = { ...config, ...rest, alerts: config.alerts };
+    if (body.config.profiles) config.profiles = migrateProfiles(body.config);
+    saveConfig();
+  }
+
+  refresh();
+  console.log(`[restore] ${Object.entries(restored).map(([f, n]) => `${f}:${n}`).join(" ")}`);
+  res.json({ ok: true, restored, rollbackSavedTo: "data/pre-restore.json" });
+});
+
 /* ── morning brief ───────────────────────────────────────────────────────── */
 
 async function buildBrief() {

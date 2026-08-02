@@ -137,6 +137,21 @@ everywhere — a 100% win rate over two signals is not a track record.
 > measuring over months. Attach a Render persistent disk mounted at `data/`, or
 > copy the files off before deploying.
 
+### `PRAVESH_DATA_URL` — required for the IPO opportunity-cost number
+`/ipo-applications/stats` reports what the engine's own positive calls returned on
+IPOs you did **not** log — the figure that can indict the app rather than flatter
+it. Computing it means reading the Pravesh snapshot, so without this env var the
+payload comes back `skipped: { available: false, reason: "PRAVESH_DATA_URL not
+set" }`, and the dashboard prints that reason where the number would be. Point it
+at the same file the dashboard reads:
+
+```
+PRAVESH_DATA_URL=https://raw.githubusercontent.com/hardik-goel/pravesh-engine/master/data/latest.json
+```
+
+Every other IPO statistic — applied, allotment rate, listing gains on allotted —
+works without it.
+
 ## Deploy free (Render — ~10 min, no card)
 1. Push this folder to a new GitHub repo.
 2. render.com → New → Web Service → connect the repo.

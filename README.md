@@ -72,6 +72,71 @@ Two gotchas worth knowing up front:
   was verified: two stocks with identical passing fundamentals, differing only in
   `status`, so the gate was the single variable.
 
+## Watchlists
+`universe.json` may be a flat list or `{ "groups": { "Default": [...] } }`. A flat
+file migrates into `Default` on first load, and the `/universe` routes keep
+operating on that group, so nothing that spoke the old shape breaks.
+
+The engine scans the **union** of every group — a symbol in any list is watched
+exactly once. Groups are how the dashboard slices the view, not what the engine
+iterates. Each snapshot row carries `groups: ["Default", "Swing"]`.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | /watchlists | all groups, counts, total under watch |
+| POST | /watchlists | create `{ name }` |
+| PATCH | /watchlists/:name | rename `{ name }` |
+| DELETE | /watchlists/:name | delete; refuses the last remaining list |
+| POST | /watchlists/:name/add | `{ symbols: [] }` |
+| POST | /watchlists/:name/remove | `{ symbols: [] }` |
+| POST | /watchlists/:name/move | `{ to, symbols: [] }` |
+
+Deleting a list drops symbols held only by it out of the scan set. Removing via
+`/universe/remove` removes the symbol from **every** group — otherwise it would
+keep being scanned while appearing to have gone.
+
+## Track record — is this worth paying for?
+The point of this module is to answer that before a Kite subscription, and to be
+capable of answering "no". Nothing in it rounds in the app's favour.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | /signals/history?from=&to= | fired signals with their outcomes |
+| GET | /signals/stats?days= | win rate, average, median, best/worst per horizon, split by criteria combination |
+| GET/POST | /paper-trades | log a bet |
+| PATCH/DELETE | /paper-trades/:id | update or close |
+| GET | /paper-trades/stats?days=&horizon= | win rate, expectancy, profit factor, and your picking vs taking every signal |
+| GET/POST | /ipo-applications | log an application |
+| PATCH/DELETE | /ipo-applications/:id | update or remove |
+| GET | /ipo-applications/stats?days= | allotment rate, listing gains, and what you passed on |
+
+**Every signal keeps its evidence.** The record stores which criteria locked and
+the value that locked each one, so a signal can be re-examined months later
+rather than recalled. Forward returns are marked at 1, 3, 7 and 30 days from the
+fire price, along with `maxGain` and `maxDrawdown` — a signal that ran +8% before
+closing −2% is a different animal from one that drifted down all week, and only
+the path tells them apart.
+
+**The comparison that matters** is in `/paper-trades/stats` → `selection`: the
+average return of the trades you actually took against the average return of
+*every* signal over the same window. A negative `edgePct` means the raw system
+beat your selection of it, and the honest response is to take more of its
+signals, not fewer.
+
+**Stated assumptions.** Every stats payload carries an `assumptions` array, and
+they are not decoration: returns are measured from the delayed-feed price at fire
+time rather than a fill you could have got, horizons are wall-clock so a 1-day
+return can span a weekend, and **no brokerage, STT, slippage or impact cost is
+included anywhere**. Real costs will make every figure worse. Signals still
+inside a horizon are reported as `pending`, never as zero, and `n` is stated
+everywhere — a 100% win rate over two signals is not a track record.
+
+> **These records do not survive a redeploy on Render's free tier.** They live in
+> `data/`, on the same ephemeral disk as the fundamentals cache, so a deploy
+> starts your track record from nothing. That defeats the entire purpose of
+> measuring over months. Attach a Render persistent disk mounted at `data/`, or
+> copy the files off before deploying.
+
 ## Deploy free (Render — ~10 min, no card)
 1. Push this folder to a new GitHub repo.
 2. render.com → New → Web Service → connect the repo.

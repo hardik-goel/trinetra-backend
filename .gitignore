@@ -11,5 +11,10 @@ universe.runtime.json
 fundamentals.cache.json
 config.json
 
+# The user's own records — signal history, paper trades, IPO applications.
+# Not committed: they are personal trading data, not project state. See the
+# README on making these survive a redeploy; on an ephemeral host they do not.
+data/
+
 # macOS
 .DS_Store

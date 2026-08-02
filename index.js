@@ -27,6 +27,13 @@ import { cachedForecasts, ensureForecasts, mergeForecasts } from "./lib/oracle.j
 import { startKeepAlive } from "./lib/keepalive.js";
 import { fetchFundamentals } from "./lib/fundamentals.js";
 import { METRIC_KEYS } from "./fundamentals.config.js";
+import {
+  DEFAULT_GROUP, cleanName, migrate as migrateGroups, union as unionGroups,
+  groupsFor, counts as groupCounts,
+} from "./lib/watchlists.js";
+import * as history from "./lib/history.js";
+import * as paper from "./lib/paper.js";
+import * as ipo from "./lib/ipo.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = f => JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8"));
@@ -41,7 +48,7 @@ const FUNDAMENTALS = read("fundamentals.json");
 const UNIVERSE_PATH = path.join(__dirname, "universe.runtime.json");
 const MAX_SYMBOLS = 200;
 const SYMBOL_RE = /^[A-Z0-9&-]+$/; // NSE symbol charset
-let SYMBOLS = fs.existsSync(UNIVERSE_PATH) ? read("universe.runtime.json") : read("universe.json");
+const RAW_UNIVERSE = fs.existsSync(UNIVERSE_PATH) ? read("universe.runtime.json") : read("universe.json");
 
 // One normalizer behind every /universe endpoint: trim, uppercase, drop
 // anything off-charset, dedupe, cap. Order of first appearance is kept.
@@ -56,8 +63,27 @@ function cleanSymbols(list) {
   return out;
 }
 
-SYMBOLS = cleanSymbols(SYMBOLS); // a hand-edited file gets the same treatment
-const saveUniverse = () => { try { fs.writeFileSync(UNIVERSE_PATH, JSON.stringify(SYMBOLS, null, 2)); } catch {} };
+/* Watchlists. The engine scans the union of every group — a symbol in any list
+   is watched once — while groups are how the dashboard slices the view. A flat
+   universe file migrates into "Default", and the /universe endpoints keep
+   operating on that group, so the old shape keeps working. */
+let GROUPS = migrateGroups(RAW_UNIVERSE, cleanSymbols);
+let SYMBOLS = unionGroups(GROUPS, cleanSymbols);
+const saveUniverse = () => { try { fs.writeFileSync(UNIVERSE_PATH, JSON.stringify({ groups: GROUPS }, null, 2)); } catch {} };
+
+// Every mutation funnels through here: recompute the scan set, persist, and
+// re-tag the live snapshot. Re-tagging matters even when no refresh follows —
+// group membership is what the dashboard filters on, and leaving it a minute
+// stale would show a symbol in the list it was just moved out of.
+function commitGroups(refreshNow = true) {
+  SYMBOLS = unionGroups(GROUPS, cleanSymbols);
+  saveUniverse();
+  if (snapshot.data.length) {
+    snapshot = { ...snapshot, data: snapshot.data.map(q => ({ ...q, groups: groupsFor(GROUPS, q.symbol) })) };
+  }
+  if (refreshNow) refresh();
+  return GROUPS;
+}
 
 // Scraped fundamentals, cached because they only move quarterly. The committed
 // fundamentals.json stays as the durable seed underneath — same ephemeral
@@ -233,10 +259,17 @@ async function refresh() {
     // hold up a market refresh. The fetch runs in the background and re-merges
     // into the published snapshot the moment it lands.
     const enriched = mergeForecasts(quotes, cachedForecasts());
-    snapshot = { at: Date.now(), data: enriched.map(q => ({ ...q, fund: fundFor(q.symbol) })) };
+    snapshot = {
+      at: Date.now(),
+      data: enriched.map(q => ({ ...q, fund: fundFor(q.symbol), groups: groupsFor(GROUPS, q.symbol) })),
+    };
     const withFcst = snapshot.data.filter(q => q.fcst).length;
     console.log(`[trinetra] ${snapshot.data.length} symbols via ${PROVIDER} · ${withFcst} with a forecast`);
     scan();
+    // Track record upkeep: what past signals did next, and where open bets stand.
+    const priceBySymbol = Object.fromEntries(snapshot.data.map(q => [q.symbol, q.price]));
+    history.markOutcomes(priceBySymbol);
+    paper.markToMarket(priceBySymbol);
     ensureForecasts(SYMBOLS, applyForecasts);
   } catch (e) {
     console.error("[trinetra] refresh failed:", e.message);
@@ -264,6 +297,13 @@ function scan() {
         count: ev.count, total: ev.total, at: Date.now(),
       };
       signalLog = [entry, ...signalLog].slice(0, 100);
+      // Durable record with the evidence at fire time — /signals is a live tail,
+      // this is the thing the track record is computed from.
+      const rec = history.recordSignal({
+        symbol: s.symbol, name: s.name, price: s.price,
+        groups: s.groups || [], evaluation: ev, at: entry.at,
+      });
+      entry.id = rec.id;
       if (config.alerts?.telegram?.on) {
         notify(config.alerts.telegram, entry).catch(e => console.error("[alert]", e.message));
       }
@@ -293,17 +333,22 @@ app.get("/snapshot", (_, res) =>
 
 app.get("/signals", (_, res) => res.json(signalLog));
 
-app.get("/universe", (_, res) => res.json({ symbols: SYMBOLS }));
+/* The /universe routes predate watchlists and stay pointed at the Default
+   group, so anything that spoke the flat shape keeps working unchanged. They
+   report the whole scan set, because that is what "the universe" still means. */
+const group = name => (GROUPS[name] ||= []);
+const universeResponse = () => ({ symbols: SYMBOLS, groups: groupCounts(GROUPS) });
+
+app.get("/universe", (_, res) => res.json(universeResponse()));
 
 // Replace the whole list. An empty array is legal — that is "Clear all".
 app.post("/universe", (req, res) => {
   if (!Array.isArray(req.body?.symbols)) return res.status(400).json({ error: "symbols must be an array" });
   const before = new Set(SYMBOLS);
-  SYMBOLS = cleanSymbols(req.body.symbols);
-  saveUniverse();
+  GROUPS[DEFAULT_GROUP] = cleanSymbols(req.body.symbols);
+  commitGroups(); // not awaited — the caller gets the list now, quotes land next tick
   ensureFundamentals(SYMBOLS.filter(s => !before.has(s)));
-  refresh(); // not awaited — the caller gets the list now, quotes land next tick
-  res.json({ symbols: SYMBOLS });
+  res.json(universeResponse());
 });
 
 app.post("/universe/add", (req, res) => {
@@ -311,22 +356,21 @@ app.post("/universe/add", (req, res) => {
   if (!symbol) return res.status(400).json({ error: "invalid symbol" });
   if (!SYMBOLS.includes(symbol)) {
     if (SYMBOLS.length >= MAX_SYMBOLS) return res.status(400).json({ error: `universe is full (max ${MAX_SYMBOLS})` });
-    SYMBOLS = [...SYMBOLS, symbol];
-    saveUniverse();
+    group(DEFAULT_GROUP).push(symbol);
+    commitGroups();
     ensureFundamentals([symbol]);
-    refresh();
   }
-  res.json({ symbols: SYMBOLS });
+  res.json(universeResponse());
 });
 
 app.post("/universe/remove", (req, res) => {
   const [symbol] = cleanSymbols([req.body?.symbol]);
   if (!symbol) return res.status(400).json({ error: "invalid symbol" });
-  if (SYMBOLS.includes(symbol)) {
-    SYMBOLS = SYMBOLS.filter(s => s !== symbol);
-    saveUniverse();
-  }
-  res.json({ symbols: SYMBOLS });
+  // Removing from "the universe" means removing it everywhere — a symbol left
+  // in another group would keep being scanned and look like it never left.
+  for (const name of Object.keys(GROUPS)) GROUPS[name] = GROUPS[name].filter(s => s !== symbol);
+  commitGroups(false);
+  res.json(universeResponse());
 });
 
 app.post("/universe/bulk-add", (req, res) => {
@@ -334,21 +378,149 @@ app.post("/universe/bulk-add", (req, res) => {
   const had = new Set(SYMBOLS);
   const before = SYMBOLS.length;
   // Existing symbols go first, so an over-cap paste is what gets dropped.
-  SYMBOLS = cleanSymbols([...SYMBOLS, ...cleanSymbols(req.body.symbols)]);
+  GROUPS[DEFAULT_GROUP] = cleanSymbols([...group(DEFAULT_GROUP), ...cleanSymbols(req.body.symbols)]);
+  commitGroups(false);
   const added = SYMBOLS.length - before;
-  if (added) { saveUniverse(); ensureFundamentals(SYMBOLS.filter(s => !had.has(s))); refresh(); }
-  res.json({ symbols: SYMBOLS, added, skipped: req.body.symbols.length - added });
+  if (added) { ensureFundamentals(SYMBOLS.filter(s => !had.has(s))); refresh(); }
+  res.json({ ...universeResponse(), added, skipped: req.body.symbols.length - added });
 });
 
 app.post("/universe/bulk-remove", (req, res) => {
   if (!Array.isArray(req.body?.symbols)) return res.status(400).json({ error: "symbols must be an array" });
   const drop = new Set(cleanSymbols(req.body.symbols));
   const before = SYMBOLS.length;
-  SYMBOLS = SYMBOLS.filter(s => !drop.has(s));
-  const removed = before - SYMBOLS.length;
-  if (removed) saveUniverse();
-  res.json({ symbols: SYMBOLS, removed });
+  for (const name of Object.keys(GROUPS)) GROUPS[name] = GROUPS[name].filter(s => !drop.has(s));
+  commitGroups(false);
+  res.json({ ...universeResponse(), removed: before - SYMBOLS.length });
 });
+
+/* ── watchlists ──────────────────────────────────────────────────────────
+   Groups slice the same scan set; they never widen or narrow what the engine
+   watches beyond their union. */
+
+app.get("/watchlists", (_, res) =>
+  res.json({ groups: GROUPS, counts: groupCounts(GROUPS), total: SYMBOLS.length }));
+
+app.post("/watchlists", (req, res) => {
+  const name = cleanName(req.body?.name);
+  if (!name) return res.status(400).json({ error: "invalid name" });
+  if (GROUPS[name]) return res.status(409).json({ error: "watchlist already exists" });
+  GROUPS[name] = [];
+  commitGroups(false);
+  res.json({ groups: GROUPS, counts: groupCounts(GROUPS) });
+});
+
+app.patch("/watchlists/:name", (req, res) => {
+  const from = cleanName(req.params.name);
+  const to = cleanName(req.body?.name);
+  if (!GROUPS[from]) return res.status(404).json({ error: "no such watchlist" });
+  if (!to) return res.status(400).json({ error: "invalid name" });
+  if (to !== from && GROUPS[to]) return res.status(409).json({ error: "watchlist already exists" });
+  if (to !== from) {
+    // Rebuilt in order so a rename does not shuffle the dashboard's tabs.
+    GROUPS = Object.fromEntries(Object.entries(GROUPS).map(([k, v]) => [k === from ? to : k, v]));
+    commitGroups(false);
+  }
+  res.json({ groups: GROUPS, counts: groupCounts(GROUPS) });
+});
+
+app.delete("/watchlists/:name", (req, res) => {
+  const name = cleanName(req.params.name);
+  if (!GROUPS[name]) return res.status(404).json({ error: "no such watchlist" });
+  // Refusing the last one keeps "where do symbols go" answerable at all times.
+  if (Object.keys(GROUPS).length === 1) return res.status(400).json({ error: "cannot delete the last watchlist" });
+  delete GROUPS[name];
+  commitGroups(false); // symbols only in that list drop out of the scan set
+  res.json({ groups: GROUPS, counts: groupCounts(GROUPS) });
+});
+
+app.post("/watchlists/:name/add", (req, res) => {
+  const name = cleanName(req.params.name);
+  if (!GROUPS[name]) return res.status(404).json({ error: "no such watchlist" });
+  const add = cleanSymbols(req.body?.symbols ?? [req.body?.symbol]);
+  if (!add.length) return res.status(400).json({ error: "symbols must be a non-empty array" });
+  const had = new Set(SYMBOLS);
+  GROUPS[name] = cleanSymbols([...GROUPS[name], ...add]);
+  if (unionGroups(GROUPS, cleanSymbols).length > MAX_SYMBOLS)
+    return res.status(400).json({ error: `universe is full (max ${MAX_SYMBOLS})` });
+  commitGroups(false);
+  const fresh = SYMBOLS.filter(s => !had.has(s));
+  if (fresh.length) { ensureFundamentals(fresh); refresh(); }
+  res.json({ groups: GROUPS, counts: groupCounts(GROUPS), added: add.length });
+});
+
+app.post("/watchlists/:name/remove", (req, res) => {
+  const name = cleanName(req.params.name);
+  if (!GROUPS[name]) return res.status(404).json({ error: "no such watchlist" });
+  const drop = new Set(cleanSymbols(req.body?.symbols ?? [req.body?.symbol]));
+  GROUPS[name] = GROUPS[name].filter(s => !drop.has(s));
+  commitGroups(false);
+  res.json({ groups: GROUPS, counts: groupCounts(GROUPS) });
+});
+
+app.post("/watchlists/:name/move", (req, res) => {
+  const from = cleanName(req.params.name);
+  const to = cleanName(req.body?.to);
+  if (!GROUPS[from]) return res.status(404).json({ error: "no such watchlist" });
+  if (!GROUPS[to]) return res.status(404).json({ error: "no such destination watchlist" });
+  const move = cleanSymbols(req.body?.symbols ?? [req.body?.symbol]).filter(s => GROUPS[from].includes(s));
+  if (!move.length) return res.status(400).json({ error: "no matching symbols in the source watchlist" });
+  GROUPS[from] = GROUPS[from].filter(s => !move.includes(s));
+  GROUPS[to] = cleanSymbols([...GROUPS[to], ...move]);
+  commitGroups(false); // union is unchanged, so no rescan is needed
+  res.json({ groups: GROUPS, counts: groupCounts(GROUPS), moved: move.length });
+});
+
+/* ── track record ────────────────────────────────────────────────────────
+   Signals, what happened next, and whether the user's picking beat the raw
+   system. The numbers are reported as they are; nothing here is smoothed. */
+
+app.get("/signals/history", (req, res) =>
+  res.json({ signals: history.list({ from: req.query.from, to: req.query.to }) }));
+
+app.get("/signals/stats", (req, res) =>
+  res.json(history.stats(Math.max(1, +req.query.days || 30))));
+
+app.get("/paper-trades", (_, res) => res.json({ trades: paper.all() }));
+
+app.post("/paper-trades", (req, res) => {
+  const t = paper.open(req.body || {});
+  if (!t) return res.status(400).json({ error: "symbol, entryPrice and qty are required" });
+  paper.markToMarket(Object.fromEntries(snapshot.data.map(q => [q.symbol, q.price])));
+  res.json(t);
+});
+
+app.patch("/paper-trades/:id", (req, res) => {
+  const t = paper.update(req.params.id, req.body || {});
+  if (!t) return res.status(404).json({ error: "no such trade" });
+  res.json(t);
+});
+
+app.delete("/paper-trades/:id", (req, res) =>
+  paper.remove(req.params.id) ? res.json({ ok: true }) : res.status(404).json({ error: "no such trade" }));
+
+app.get("/paper-trades/stats", (req, res) =>
+  res.json(paper.stats(Math.max(1, +req.query.days || 30), history.all(), Math.max(1, +req.query.horizon || 7))));
+
+app.get("/ipo-applications", (_, res) => res.json({ applications: ipo.all() }));
+
+app.post("/ipo-applications", (req, res) => {
+  const a = ipo.add(req.body || {});
+  if (!a) return res.status(400).json({ error: "ipoName is required" });
+  res.json(a);
+});
+
+app.patch("/ipo-applications/:id", (req, res) => {
+  const a = ipo.update(req.params.id, req.body || {});
+  if (!a) return res.status(404).json({ error: "no such application" });
+  res.json(a);
+});
+
+app.delete("/ipo-applications/:id", (req, res) =>
+  ipo.remove(req.params.id) ? res.json({ ok: true }) : res.status(404).json({ error: "no such application" }));
+
+app.get("/ipo-applications/stats", async (req, res) =>
+  res.json(await ipo.stats(Math.max(1, +req.query.days || 365))));
 
 app.get("/fundamentals", (_, res) => res.json(fundCache));
 

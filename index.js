@@ -166,6 +166,47 @@ console.log(
     : "awaiting config"}`
 );
 
+/* The bot token is a credential — and since it can now come from the server's
+   own environment, it is a secret the operator never handed to the browser.
+   /config is what the dashboard reads to render its settings, so it returns
+   proof-of-configuration instead of the values themselves. */
+const MASK = "••••";
+const maskTail = v => (v ? MASK + String(v).slice(-4) : "");
+const isMasked = v => typeof v === "string" && v.startsWith(MASK);
+const blank = v => v === undefined || v === null || v === "" || isMasked(v);
+
+function publicConfig() {
+  const t = config.alerts?.telegram || {};
+  const configured = !!(t.token && t.chatId);
+  return {
+    ...config,
+    alerts: {
+      ...config.alerts,
+      telegram: {
+        on: !!t.on,
+        configured,
+        tokenMasked: maskTail(t.token),
+        chatIdMasked: maskTail(t.chatId),
+        source: configured ? (seededTelegram && t.token === seededTelegram.token ? "env" : "saved") : "none",
+      },
+    },
+  };
+}
+
+/* A POST may echo back the mask it was given, or carry empty inputs from a
+   panel that never loaded the credentials in the first place. Neither is an
+   instruction to erase what is stored: only a real new value replaces it.
+   A request carrying no credential at all is a criteria sync, so its `on` is
+   ignored too — otherwise syncing criteria would silently disarm a channel
+   configured from the environment. */
+function mergeTelegram(cur = {}, next = {}) {
+  const token = blank(next.token) ? cur.token || "" : String(next.token).trim();
+  const chatId = blank(next.chatId) ? cur.chatId || "" : String(next.chatId).trim();
+  const carriesCreds = !blank(next.token) || !blank(next.chatId);
+  const on = carriesCreds && next.on !== undefined ? !!next.on : !!cur.on;
+  return { on, token, chatId };
+}
+
 let snapshot = { at: 0, data: [] };
 let signalLog = [];
 const firedToday = new Set();
@@ -231,7 +272,17 @@ function scan() {
 }
 
 const app = express();
-app.use(cors({ origin: process.env.UI_ORIGIN || "*" }));
+/* CORS applies to every route below, so the write endpoints (/config,
+   /universe, /fundamentals) are restricted by the same rule as the reads.
+   A comma-separated list is accepted for a staging origin alongside production. */
+const UI_ORIGIN = (process.env.UI_ORIGIN || "*").trim();
+const corsOrigin = UI_ORIGIN === "*"
+  ? "*"
+  : UI_ORIGIN.split(",").map(o => o.trim()).filter(Boolean);
+app.use(cors({ origin: corsOrigin }));
+console.log(`[cors] ${UI_ORIGIN === "*"
+  ? "open to any origin — set UI_ORIGIN to your dashboard origin in production"
+  : "restricted to " + [].concat(corsOrigin).join(", ")}`);
 app.use(express.json());
 
 app.get("/health", (_, res) =>
@@ -329,14 +380,19 @@ app.post("/fundamentals/refresh-all", async (_, res) => {
   res.json(summary);
 });
 
-app.get("/config", (_, res) => res.json(config));
+app.get("/config", (_, res) => res.json(publicConfig()));
 app.post("/config", (req, res) => {
   const { criteria, alerts } = req.body || {};
   if (Array.isArray(criteria)) config.criteria = criteria;
-  if (alerts) config.alerts = alerts;
+  if (alerts) {
+    config.alerts = {
+      ...config.alerts, ...alerts,
+      telegram: mergeTelegram(config.alerts?.telegram, alerts.telegram),
+    };
+  }
   saveConfig();
   scan(); // re-evaluate immediately against the new rules
-  res.json({ ok: true, config });
+  res.json({ ok: true, config: publicConfig() });
 });
 
 const PORT = process.env.PORT || 3000;

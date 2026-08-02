@@ -243,9 +243,37 @@ Declared in `render.yaml` with `sync: false`, meaning the blueprint names the ke
 but never supplies a value, so a blueprint apply can never blank what you set in
 the dashboard. `SELF_URL` and `ORACLE_URL` are declared the same way.
 
-> The token is part of `GET /config`, which is how the dashboard reads its own
-> settings. Lock `UI_ORIGIN` to your dashboard's origin in production — with the
-> default `*`, any site can read that response.
+### Secrets are never returned
+`GET /config` reports that a channel is configured without revealing it:
+
+```json
+"telegram": { "on": true, "configured": true,
+              "tokenMasked": "••••abcd", "chatIdMasked": "••••4321",
+              "source": "env" }
+```
+
+`source` is `env`, `saved` or `none`, so the dashboard can show where the
+credentials came from. The full values stay server-side for delivery and are
+never sent to a browser.
+
+Because the panel only ever sees the mask, `POST /config` treats a masked or
+empty credential as "leave it alone" — only a real new value replaces what is
+stored. A request carrying no credentials at all is a criteria sync, so its
+`on` flag is ignored too; without that, hitting **Sync criteria** from a panel
+that never loaded the credentials would silently disarm alerts armed from the
+environment. Sending a real token, or toggling `on` alongside one, works as
+before.
+
+### Lock CORS in production
+`UI_ORIGIN` restricts every route, reads and writes alike. Set it to your
+dashboard's origin — e.g. `https://trinetra-web-zeta.vercel.app`; a
+comma-separated list is accepted for a staging origin alongside production.
+Left unset it defaults to `*`, and startup says so:
+
+```
+[cors] open to any origin — set UI_ORIGIN to your dashboard origin in production
+[cors] restricted to https://trinetra-web-zeta.vercel.app
+```
 
 ## Order-book depth on free feeds
 Buyers/sellers % needs paid exchange depth — no free source has it. The

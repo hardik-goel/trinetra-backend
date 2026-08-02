@@ -22,7 +22,7 @@ import { yahooDelayed } from "./providers/yahooDelayed.js";
 import { stooqEod } from "./providers/stooqEod.js";
 import { kite } from "./providers/kite.js";
 import { evaluate } from "./lib/engine.js";
-import { notify } from "./lib/alerts.js";
+import { notify, notifyExit, notifyBrief } from "./lib/alerts.js";
 import { cachedForecasts, ensureForecasts, mergeForecasts } from "./lib/oracle.js";
 import { startKeepAlive } from "./lib/keepalive.js";
 import { fetchFundamentals } from "./lib/fundamentals.js";
@@ -34,6 +34,14 @@ import {
 import * as history from "./lib/history.js";
 import * as paper from "./lib/paper.js";
 import * as ipo from "./lib/ipo.js";
+import * as holdings from "./lib/holdings.js";
+import * as events from "./lib/events.js";
+import * as brief from "./lib/brief.js";
+import { evaluateAll as evaluateExits, DEFAULT_RULES as EXIT_RULES } from "./lib/exits.js";
+import { migrate as migrateProfiles, enabledProfiles, needsIntraday, cleanId, HORIZON_SESSIONS } from "./lib/profiles.js";
+import { potential, confidence, exitLevels, atrPct } from "./lib/analysis.js";
+import { derive as deriveIntraday } from "./lib/intraday.js";
+import { suggest as suggestSize, concentration as computeConcentration, DEFAULT_SIZING } from "./lib/sizing.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = f => JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8"));
@@ -183,6 +191,30 @@ const envTelegram = () => {
   return token && chatId ? { on: true, token, chatId } : null;
 };
 
+/* Profiles replace the single criteria set. The old flat array migrates into
+   Swing, so tuned thresholds and synced settings survive. */
+config.profiles = migrateProfiles(config);
+config.sizing = { ...DEFAULT_SIZING, ...(config.sizing || {}) };
+config.exitRules = { ...EXIT_RULES, ...(config.exitRules || {}) };
+config.briefTime = config.briefTime || "08:45";
+
+const PROVIDER_LAG_S = { yahooDelayed: 900, stooqEod: 86_400, kite: 5 };
+const FEED_DELAYED = PROVIDER !== "kite";
+
+/* Data age travels with every snapshot and every signal. Intraday on a delayed
+   feed is workable — you are trading what remains of a move — but only if the
+   staleness is impossible to overlook. */
+function dataAge() {
+  const lagSeconds = PROVIDER_LAG_S[PROVIDER] ?? 900;
+  return {
+    seconds: snapshot.at ? Math.round((Date.now() - snapshot.at) / 1000) : null,
+    lagSeconds,
+    delayed: FEED_DELAYED,
+    provider: PROVIDER,
+    asOf: snapshot.at || null,
+  };
+}
+
 const seededTelegram = envTelegram();
 if (seededTelegram) config = { ...config, alerts: { ...config.alerts, telegram: seededTelegram } };
 const tg = config.alerts?.telegram;
@@ -235,7 +267,16 @@ function mergeTelegram(cur = {}, next = {}) {
 
 let snapshot = { at: 0, data: [] };
 let signalLog = [];
-const firedToday = new Set();
+
+/* Seeded from durable history, not empty. A free-tier instance sleeps and wakes
+   many times a day; with an in-memory set, every wake would re-fire every
+   currently-locked signal — duplicating alerts and inflating the very sample
+   size the track record is measured on. */
+const firedToday = new Set(
+  history.all()
+    .filter(r => new Date(r.firedAt).toDateString() === new Date().toDateString())
+    .map(r => `${r.profileId || "swing"}:${r.symbol}`)
+);
 let lastDay = new Date().toDateString();
 
 // A scrape lands between refresh ticks. Without this the served snapshot keeps
@@ -254,14 +295,20 @@ async function refresh() {
   if (today !== lastDay) { firedToday.clear(); lastDay = today; }
 
   try {
-    const quotes = await provider(SYMBOLS);
+    const quotes = await provider(SYMBOLS, { intraday: needsIntraday(config.profiles) });
     // Merge whatever forecasts are known now — a sleeping Oracle must never
     // hold up a market refresh. The fetch runs in the background and re-merges
     // into the published snapshot the moment it lands.
     const enriched = mergeForecasts(quotes, cachedForecasts());
     snapshot = {
       at: Date.now(),
-      data: enriched.map(q => ({ ...q, fund: fundFor(q.symbol), groups: groupsFor(GROUPS, q.symbol) })),
+      data: enriched.map(q => ({
+        ...q,
+        fund: fundFor(q.symbol),
+        groups: groupsFor(GROUPS, q.symbol),
+        intraday: q.intradayBars ? deriveIntraday(q.intradayBars) : null,
+        nextEvent: events.nextEvent(q.symbol),
+      })),
     };
     const withFcst = snapshot.data.filter(q => q.fcst).length;
     console.log(`[trinetra] ${snapshot.data.length} symbols via ${PROVIDER} · ${withFcst} with a forecast`);
@@ -286,27 +333,101 @@ function applyForecasts(forecasts) {
   scan(); // a forecast can complete a confluence
 }
 
+/* The trigger level a setup qualified at — what "already moved" is measured
+   against. Without it, movedAlready would be measured from an arbitrary point. */
+function triggerFor(stock, profile) {
+  switch (profile.horizon) {
+    case "intraday": return stock.intraday?.orHigh ?? stock.dayOpen ?? stock.prevClose;
+    case "positional": return stock.high50 ?? stock.high20;
+    default: return stock.high20;
+  }
+}
+
+/** Everything A8 produces for one stock under one profile. */
+function analyse(stock, profile, ev) {
+  const pot = potential(stock, { horizon: profile.horizon, triggerPrice: triggerFor(stock, profile) });
+  const conf = confidence(stock, { profile, evaluation: ev, pot, dataAge: dataAge(), event: stock.nextEvent });
+  const exits = pot ? exitLevels(stock, { pot, conf, atr: atrPct(stock.candles) }) : null;
+  return { potential: pot, confidence: conf, exits };
+}
+
 function scan() {
+  const active = enabledProfiles(config.profiles);
   for (const s of snapshot.data) {
-    const ev = evaluate(s, config.criteria);
-    if (ev.locked && !firedToday.has(s.symbol)) {
-      firedToday.add(s.symbol);
+    const results = {};
+    for (const [id, profile] of active) {
+      const ev = evaluate(s, profile.criteria);
+      results[id] = { count: ev.count, total: ev.total, locked: ev.locked, criteria: ev.criteria };
+
+      const key = `${id}:${s.symbol}`;
+      if (!ev.locked || firedToday.has(key)) continue;
+      firedToday.add(key);
+
+      const { potential: pot, confidence: conf, exits } = analyse(s, profile, ev);
+      const age = dataAge();
+      const event = s.nextEvent;
+      const horizonDays = HORIZON_SESSIONS[profile.horizon] ?? 5;
+
       const entry = {
         symbol: s.symbol, name: s.name, price: s.price,
-        volX: +ev.volX.toFixed(1), dayChg: +ev.dayChg.toFixed(1),
+        profileId: id, profileName: profile.name, horizon: profile.horizon,
+        volX: +(ev.volX || 0).toFixed(1), dayChg: +(ev.dayChg || 0).toFixed(1),
         count: ev.count, total: ev.total, at: Date.now(),
+        dataAge: age,
+        potential: pot, confidence: conf, exits,
+        // Intraday on a delayed feed is the user's explicit choice. It is
+        // supported — and it always says what it is.
+        lagDisclosure: profile.horizon === "intraday" && age.delayed
+          ? `Prices are ~${Math.round(age.lagSeconds / 60)} minutes delayed. This stock has already moved ${pot?.movedAlreadyPct >= 0 ? "+" : ""}${pot?.movedAlreadyPct ?? 0}% since the trigger level; the estimate below is what may remain, not the full move.`
+          : null,
+        eventWarning: event && event.daysAway <= 3
+          ? `${event.type === "results" ? "Results" : event.type} due in ${event.daysAway} day${event.daysAway === 1 ? "" : "s"} — this signal carries binary event risk.`
+          : null,
       };
       signalLog = [entry, ...signalLog].slice(0, 100);
+
       // Durable record with the evidence at fire time — /signals is a live tail,
       // this is the thing the track record is computed from.
       const rec = history.recordSignal({
         symbol: s.symbol, name: s.name, price: s.price,
         groups: s.groups || [], evaluation: ev, at: entry.at,
+        profileId: id, horizon: profile.horizon,
+        potential: pot, confidence: conf, exits, dataAge: age,
       });
       entry.id = rec.id;
-      if (config.alerts?.telegram?.on) {
+
+      if (config.alerts?.telegram?.on && profile.alerts?.telegram !== false) {
         notify(config.alerts.telegram, entry).catch(e => console.error("[alert]", e.message));
       }
+    }
+    s.profileResults = results;
+  }
+  scanExits();
+}
+
+/* Exit signals are deduped per rule per holding: an alert that repeats every
+   minute is one the user learns to ignore, which is the failure mode that
+   matters most for the rule that concerns money already at risk. */
+const exitAlerted = new Set();
+let activeExits = [];
+
+function scanExits() {
+  const bySymbol = Object.fromEntries(snapshot.data.map(q => [q.symbol, q]));
+  activeExits = evaluateExits(
+    holdings.open(), bySymbol,
+    h => {
+      const p = config.profiles[h.profileId] || config.profiles.swing;
+      const s = bySymbol[h.symbol];
+      return s && p ? evaluate(s, p.criteria) : null;
+    },
+    config.exitRules
+  );
+
+  for (const e of activeExits) {
+    if (exitAlerted.has(e.id)) continue;
+    exitAlerted.add(e.id);
+    if (config.alerts?.telegram?.on) {
+      notifyExit(config.alerts.telegram, e).catch(err => console.error("[alert]", err.message));
     }
   }
 }
@@ -329,7 +450,13 @@ app.get("/health", (_, res) =>
   res.json({ ok: true, provider: PROVIDER, lastRefresh: snapshot.at, symbols: snapshot.data.length, delayed: PROVIDER === "yahooDelayed" }));
 
 app.get("/snapshot", (_, res) =>
-  res.json({ asOf: snapshot.at, provider: PROVIDER, delayed: PROVIDER === "yahooDelayed", data: snapshot.data }));
+  res.json({
+    asOf: snapshot.at, provider: PROVIDER, delayed: FEED_DELAYED,
+    dataAge: dataAge(),
+    // The candle series is for server-side analysis only; shipping 250 bars per
+    // symbol to the browser every few seconds would be pure weight.
+    data: snapshot.data.map(({ candles, intradayBars, ...rest }) => rest),
+  }));
 
 app.get("/signals", (_, res) => res.json(signalLog));
 
@@ -522,6 +649,166 @@ app.delete("/ipo-applications/:id", (req, res) =>
 app.get("/ipo-applications/stats", async (req, res) =>
   res.json(await ipo.stats(Math.max(1, +req.query.days || 365))));
 
+/* ── profiles ────────────────────────────────────────────────────────────── */
+
+app.get("/profiles", (_, res) => res.json({ profiles: config.profiles }));
+
+app.post("/profiles", (req, res) => {
+  const id = cleanId(req.body?.id || req.body?.name);
+  if (!id) return res.status(400).json({ error: "invalid id" });
+  if (config.profiles[id]) return res.status(409).json({ error: "profile already exists" });
+  config.profiles[id] = {
+    name: req.body?.name || id,
+    horizon: req.body?.horizon || "swing",
+    enabled: req.body?.enabled !== false,
+    requiresLiveData: !!req.body?.requiresLiveData,
+    alerts: req.body?.alerts || { telegram: true },
+    criteria: Array.isArray(req.body?.criteria) ? req.body.criteria : [],
+  };
+  saveConfig(); scan();
+  res.json({ profiles: config.profiles });
+});
+
+app.patch("/profiles/:id", (req, res) => {
+  const p = config.profiles[cleanId(req.params.id)];
+  if (!p) return res.status(404).json({ error: "no such profile" });
+  for (const k of ["name", "horizon", "requiresLiveData"]) if (req.body?.[k] !== undefined) p[k] = req.body[k];
+  if (req.body?.enabled !== undefined) p.enabled = !!req.body.enabled;
+  if (req.body?.alerts) p.alerts = { ...p.alerts, ...req.body.alerts };
+  if (Array.isArray(req.body?.criteria)) p.criteria = req.body.criteria;
+  saveConfig(); scan();
+  res.json({ profiles: config.profiles });
+});
+
+app.delete("/profiles/:id", (req, res) => {
+  const id = cleanId(req.params.id);
+  if (!config.profiles[id]) return res.status(404).json({ error: "no such profile" });
+  if (Object.keys(config.profiles).length === 1) return res.status(400).json({ error: "cannot delete the last profile" });
+  delete config.profiles[id];
+  saveConfig(); scan();
+  res.json({ profiles: config.profiles });
+});
+
+/* ── holdings & exits ────────────────────────────────────────────────────── */
+
+const stockBySymbol = () => Object.fromEntries(snapshot.data.map(q => [q.symbol, q]));
+
+app.get("/holdings", (_, res) => res.json({ holdings: holdings.all() }));
+
+app.post("/holdings", (req, res) => {
+  // One tap: { symbol } is enough. Entry price, the thesis and the levels the
+  // exit rules need are all captured from the current snapshot.
+  const sym = String(req.body?.symbol ?? "").trim().toUpperCase();
+  const stock = stockBySymbol()[sym];
+  const profileId = req.body?.profileId || "swing";
+  const p = config.profiles[profileId];
+  const ev = stock && p ? evaluate(stock, p.criteria) : null;
+  const h = holdings.add({ ...req.body, profileId }, stock, ev);
+  if (!h) return res.status(400).json({ error: "symbol required, and it must be in the watchlist or carry an entryPrice" });
+  holdings.markToMarket(stockBySymbol());
+  scanExits();
+  res.json(h);
+});
+
+app.patch("/holdings/:id", (req, res) => {
+  const h = holdings.update(req.params.id, req.body || {});
+  if (!h) return res.status(404).json({ error: "no such holding" });
+  scanExits();
+  res.json(h);
+});
+
+app.delete("/holdings/:id", (req, res) =>
+  holdings.remove(req.params.id) ? res.json({ ok: true }) : res.status(404).json({ error: "no such holding" }));
+
+app.get("/exit-signals", (_, res) =>
+  res.json({ signals: activeExits, rules: config.exitRules, dataAge: dataAge() }));
+
+/* ── sizing & concentration ──────────────────────────────────────────────── */
+
+app.get("/sizing/config", (_, res) => res.json(config.sizing));
+app.post("/sizing/config", (req, res) => {
+  for (const k of ["capital", "riskPerTradePct", "defaultStopPct", "sectorLimitPct"])
+    if (req.body?.[k] !== undefined) config.sizing[k] = +req.body[k];
+  saveConfig();
+  res.json(config.sizing);
+});
+
+app.get("/sizing", (req, res) => {
+  const sym = String(req.query.symbol ?? "").trim().toUpperCase();
+  const entry = +req.query.entry || stockBySymbol()[sym]?.price;
+  res.json(suggestSize({ entry, stop: +req.query.stop, ...config.sizing }));
+});
+
+app.get("/concentration", (_, res) =>
+  res.json(computeConcentration(holdings.open(), stockBySymbol(), config.sizing)));
+
+app.get("/events", (_, res) => res.json({ events: events.all() }));
+
+/* ── morning brief ───────────────────────────────────────────────────────── */
+
+async function buildBrief() {
+  const age = dataAge();
+  let ipos = [];
+  try {
+    const url = process.env.PRAVESH_DATA_URL;
+    if (url) {
+      const r = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+      if (r.ok) {
+        const j = await r.json();
+        const rows = Array.isArray(j) ? j : j.ipos || j.data || [];
+        const soon = Date.now() + 2 * 86_400_000;
+        ipos = rows.filter(x => {
+          const close = Date.parse(x.closeDate || x.close_date || "");
+          return Number.isFinite(close) && close >= Date.now() - 86_400_000 && close <= soon;
+        }).map(x => ({ name: x.name || x.ipoName, verdict: x.verdict || x.call, closeDate: x.closeDate || x.close_date }));
+      }
+    }
+  } catch { /* degrade silently — the brief is still worth sending */ }
+
+  return brief.build({
+    signals: history.all(),
+    holdings: holdings.open(),
+    exitSignals: activeExits,
+    events: events.upcoming(SYMBOLS, 3),
+    concentration: computeConcentration(holdings.open(), stockBySymbol(), config.sizing),
+    ipos,
+    profiles: config.profiles,
+    dataHealth: {
+      provider: PROVIDER, delayed: age.delayed, lagSeconds: age.lagSeconds,
+      ageSeconds: age.seconds, lastRefresh: snapshot.at,
+      symbols: snapshot.data.length, expected: SYMBOLS.length,
+      failures: Math.max(0, SYMBOLS.length - snapshot.data.length),
+    },
+  });
+}
+
+app.get("/brief", async (_, res) => res.json(await buildBrief()));
+
+app.post("/brief/send", async (_, res) => {
+  const b = await buildBrief();
+  const ok = await notifyBrief(config.alerts?.telegram, brief.renderTelegram(b));
+  res.json({ ok });
+});
+
+/* Scheduled brief. Timezone-correct IST, same approach as the keep-alive: the
+   server clock is UTC on Render, so local time is never trusted. Fires once per
+   weekday within the minute the user configured. */
+let lastBriefDay = "";
+function briefTick() {
+  if (!isFinite(Date.now())) return;
+  if (!brief.isWeekday()) return;
+  const [hh, mm] = String(config.briefTime || "08:45").split(":").map(Number);
+  const target = (hh || 8) * 60 + (mm || 45);
+  const now = brief.istMinutes();
+  const day = brief.istNow().toISOString().slice(0, 10);
+  if (day === lastBriefDay || now < target || now > target + 5) return;
+  lastBriefDay = day;
+  buildBrief()
+    .then(b => notifyBrief(config.alerts?.telegram, brief.renderTelegram(b)))
+    .then(ok => console.log(`[brief] ${config.briefTime} IST brief ${ok ? "sent" : "not sent (no telegram configured)"}`))
+    .catch(e => console.warn("[brief]", e.message));
+}
+
 app.get("/fundamentals", (_, res) => res.json(fundCache));
 
 app.post("/fundamentals/refresh", async (req, res) => {
@@ -574,7 +861,19 @@ app.listen(PORT, async () => {
   // Anything still on seed values gets scraped now, so an unverified gate is a
   // state the instrument passes through rather than one it sits in.
   ensureFundamentals(SYMBOLS);
+  events.ensureEvents(SYMBOLS); // best-effort, paced, never blocks
   setInterval(refresh, REFRESH_MS);
+  setInterval(briefTick, 60_000);
+  setInterval(() => events.ensureEvents(SYMBOLS), 6 * 3_600_000);
+
+  const active = enabledProfiles(config.profiles).map(([id, p]) => `${p.name}${p.horizon === "intraday" ? "*" : ""}`);
+  console.log(`[profiles] ${active.join(", ")} (${active.length} enabled)`);
+  const intraday = enabledProfiles(config.profiles).find(([, p]) => p.horizon === "intraday");
+  if (intraday) {
+    console.log(`[profiles] intraday: active · feed ${FEED_DELAYED ? `lag ~${Math.round((PROVIDER_LAG_S[PROVIDER] ?? 900) / 60)}m (delayed) — confidence capped at 55` : "live"}`);
+  }
+  console.log(`[brief] scheduled ${config.briefTime} IST on weekdays`);
+
   // Only on hosts that sleep on idle — unset SELF_URL leaves everything as-is.
   if (process.env.SELF_URL) startKeepAlive(process.env.SELF_URL);
 });

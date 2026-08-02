@@ -10,6 +10,25 @@ origin).
 
 ---
 
+## What changed most recently (read this first)
+If you are wiring the dashboard, these are the surfaces that are new or reshaped:
+
+1. **Criteria are now profiles, not one set.** `config.criteria` is gone as the
+   thing the engine reads; `config.profiles` replaces it. Each snapshot row
+   carries `profileResults`. The old array was migrated into the `swing` profile.
+2. **`dataAge` on `/snapshot` and on every signal**, plus `lagDisclosure` on
+   intraday signals — render it verbatim, it is the honesty contract for running
+   intraday on a delayed feed.
+3. **Every signal carries `potential`, `confidence` and `exits`** (A8). These are
+   the three numbers the user decides on.
+4. **Holdings + exit signals** — one-tap `POST /holdings { symbol }`, and
+   `GET /exit-signals` returning full `rationale`.
+5. **`/brief`** assembles the whole morning view server-side, so the dashboard
+   can render it without composing it.
+6. `/snapshot` no longer ships candle arrays (server-side analysis only).
+
+---
+
 ## Market data
 
 ### `GET /health`
@@ -187,3 +206,112 @@ showing nothing.
 > These records live in `data/` on the same ephemeral disk as the caches. On
 > Render's free tier a redeploy wipes them, which defeats measuring anything over
 > months. A persistent disk mounted at `data/` is the fix.
+
+---
+
+## Profiles, exits, sizing, brief (added with this build)
+
+### `GET /profiles` · `POST` · `PATCH /profiles/:id` · `DELETE /profiles/:id`
+```json
+{ "profiles": { "intraday": { "name": "Intraday", "horizon": "intraday",
+                              "enabled": true, "requiresLiveData": false,
+                              "alerts": { "telegram": true }, "criteria": [...] },
+                "swing": {...}, "positional": {...}, "longterm": {...} } }
+```
+Horizons: `intraday` | `swing` | `positional` | `longterm`. DELETE refuses the
+last remaining profile. The dashboard's criteria editor should now edit **one
+profile at a time**, not a single global list.
+
+Each `/snapshot` row gains:
+```json
+"profileResults": { "swing": { "count": 2, "total": 3, "locked": false, "criteria": [...] } }
+```
+Use this for a per-horizon column or tab. `criteria` matches the existing
+`evaluate()` shape, so existing rendering works per profile.
+
+### Signals — new fields
+```json
+{ "id": "sig_...", "symbol": "POLYCAB", "profileId": "swing", "profileName": "Swing",
+  "horizon": "swing", "count": 3, "total": 3,
+  "dataAge": { "seconds": 41, "lagSeconds": 900, "delayed": true, "provider": "yahooDelayed" },
+  "lagDisclosure": "Prices are ~15 minutes delayed. This stock has already moved +3.1% since the trigger level; the estimate below is what may remain, not the full move.",
+  "eventWarning": "Results due in 2 days — this signal carries binary event risk.",
+  "potential": {
+    "horizon": "swing", "sessions": 5, "triggerPrice": 8827, "movedAlreadyPct": 3.09,
+    "estRangePct": { "low": 1.2, "median": 2.4, "high": 4.8 },
+    "remainingPct": { "low": 0, "median": 0, "high": 1.7 },
+    "exhausted": true, "converged": false,
+    "cappedBy": "resistance:swing-high@9169.5",
+    "resistance": { "level": "swing-high", "price": 9169.5 },
+    "analogs": { "n": 10, "medianMFE": 2.36, "medianMAE": -2.67, "winRate": 50 },
+    "basis": "10 comparable setups in this stock; median best case +2.36%, typical drawdown -2.67% over 5 sessions. Matched on breakout and volume shape, not on the full criteria set."
+  },
+  "confidence": { "score": 40, "band": "low",
+                  "components": [ { "name": "Evidence depth", "contribution": 6, "note": "10 historical analogs" } ],
+                  "caps": ["delayed feed: capped at 65"],
+                  "summary": "Low (40). …" },
+  "exits": { "safe": { "pct": 1.2, "price": 9209, "rationale": "…" },
+             "primary": {...}, "stretch": {...}, "stop": {...},
+             "riskReward": { "toSafe": 0.4, "toPrimary": 0.8, "toStretch": 1.6 },
+             "riskRewardWarning": "Risk-reward to the primary target is below 1:1.",
+             "suggestion": "…reasoning, never an instruction…" } }
+```
+
+**Rendering rules that are not optional:**
+- `potential` is **null for `longterm`** — a % target over years is meaningless
+  and is deliberately not produced. Do not render an empty range; say the
+  horizon does not carry one.
+- `insufficientHistory: true` means **no numeric range exists** (fewer than 8
+  analogs). Show `bounds` and `basis`, never a fabricated range.
+- `exhausted: true` — lead with it. The typical move already happened.
+- `converged: true` — safe/primary/stretch are the *same* level because
+  resistance is close overhead. Render one level, not three identical ones.
+- Always show `analogs.n` next to any range, and `confidence.caps` next to any
+  score, or the user cannot tell why nothing ever scores high.
+
+### `GET /holdings` · `POST /holdings` · `PATCH /holdings/:id` · `DELETE`
+`POST { symbol }` is enough — **one tap**. The user does not paper-trade and will
+not fill a form; entry price, levels and the locked criteria are captured from
+the snapshot. Optional: `entryPrice, qty, stopLoss, target, profileId, note`.
+
+### `GET /exit-signals`
+```json
+{ "signals": [ { "id": "hld_x:structure_break", "holdingId": "hld_x", "symbol": "POLYCAB",
+    "rule": "structure_break", "headline": "Trend structure broke",
+    "reasoning": "You marked this at ₹1,240 on a breakout above the 20-day high of ₹1,232. Price has now fallen to ₹1,148, below the 20-day low of ₹1,160 — the structure that justified the entry no longer holds.",
+    "evidence": { "entryPrice": 1240, "currentPrice": 1148, "triggerLevel": 1160,
+                  "pctFromEntry": -7.4, "daysHeld": 9 },
+    "severity": "high", "suggestedAction": "Consider exiting",
+    "note": "Decision support, not an instruction — the call is yours." } ],
+  "rules": {...}, "dataAge": {...} }
+```
+Sorted highest severity first. **Render `reasoning` prominently — it is the whole
+point of the feature.** Never render a bare "SELL"; the API never says it.
+
+### Sizing & concentration
+- `GET /sizing/config` · `POST /sizing/config { capital, riskPerTradePct, defaultStopPct, sectorLimitPct }`
+- `GET /sizing?symbol=&entry=&stop=` → `{ qty, rupeeRisk, positionValue, positionPctOfCapital, stopAssumed, notes[] }`.
+  `stopAssumed: true` means the stop was invented — surface `notes`.
+  Returns `{ error }` when capital is unset.
+- `GET /concentration` → `{ sectors[], largestPosition, warnings[], caveats[] }`.
+  Render `caveats` — they state what the numbers cannot see.
+
+### `GET /brief` · `POST /brief/send`
+```json
+{ "generatedAt": 0,
+  "newSignals": { "total": 3, "byProfile": { "swing": [ …signals… ] } },
+  "holdings": [ { "symbol", "entryPrice", "unrealisedPct", "daysHeld", "exitSignals": [...] } ],
+  "exitSignals": [...], "ipos": [...], "events": [ { "symbol", "event": { "type", "date", "daysAway" } } ],
+  "concentration": {...},
+  "dataHealth": { "provider", "delayed", "lagSeconds", "ageSeconds", "lastRefresh", "symbols", "expected", "failures" } }
+```
+Order is deliberate: **exit signals first** (money already at risk), then new
+signals by profile, then IPOs closing, then events. Keep that order in the UI.
+`dataHealth` must be visible so a stale brief is never read as a live one.
+
+A Telegram brief fires at 08:45 IST on weekdays (`config.briefTime`). An empty
+brief is still sent — silence means breakage, never emptiness.
+
+### `GET /events`
+`{ events: { SYMBOL: { checkedAt, events: [ { type, date } ] } } }`. Absent means
+"could not establish", never "no event" — do not render absence as safety.

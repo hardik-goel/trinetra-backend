@@ -72,6 +72,115 @@ Two gotchas worth knowing up front:
   was verified: two stocks with identical passing fundamentals, differing only in
   `status`, so the gate was the single variable.
 
+## Criteria profiles (multi-horizon)
+One criteria set forced one answer to four different questions. There are now
+four profiles, each evaluated independently against every stock, each with its
+own criteria and alert preference:
+
+| Profile | Horizon | Keys on |
+|---------|---------|---------|
+| Intraday | rest of session | opening-range break, VWAP, volume vs the same time yesterday, position in the day's range |
+| Swing | ~5 sessions | fundamentals + 20-day breakout + volume shocker (the original set) |
+| Positional | ~20 sessions | 50-day breakout, sustained volume, firmer fundamental floor |
+| Long term | — | ROE/ROCE/margins, low debt, durable growth, promoter commitment; no day-move criterion |
+
+An existing flat `criteria` array migrates into **Swing**, so tuned thresholds
+survive. Signals record which profile fired them, and the track record keeps
+them separable — blending an intraday win rate into a long-term one would
+describe a strategy nobody runs.
+
+`GET /profiles`, `POST /profiles`, `PATCH /profiles/:id`, `DELETE /profiles/:id`
+(refuses the last one). Each snapshot row carries
+`profileResults: { <id>: { count, total, locked, criteria } }`.
+
+### Intraday on a delayed feed — what you are actually trading
+Intraday is **on** by default and works on the ~15-minute delayed feed, because
+if the estimated potential exceeds the move already captured, the remainder is
+tradeable. That is a legitimate way to use this data, and it is only legitimate
+while the staleness is impossible to overlook. So:
+
+- Every snapshot and signal carries `dataAge: { seconds, lagSeconds, delayed, provider, asOf }`.
+- Every intraday signal carries a `lagDisclosure` sentence naming how much of
+  the move is already gone, meant to be rendered verbatim.
+- **Confidence is capped, not nudged**: 65 on any delayed feed, 55 for intraday
+  on one. The top band is unreachable by design. That is the honest consequence
+  of trading the tail of a move you cannot see in real time.
+
+Set `PROVIDER=kite` and the lag collapses, the cap lifts automatically, and the
+order-flow criteria start returning data. No code change.
+
+## Holdings and exit signals
+Marking a holding is one tap — `POST /holdings { symbol }`. Entry price, the
+levels, and **the criteria that were locked at that moment** are captured from
+the snapshot, because "the reason you bought no longer holds" cannot be detected
+later without a record of what that reason was.
+
+Seven rules run per holding on every refresh: stop-loss, target, trailing stop
+(default 8% off the peak since entry), structure break, volume dry-up, thesis
+break, and time stop. `GET /exit-signals`.
+
+**Every exit signal states its reasoning in full.** An alert that says "SELL" and
+nothing else demands the most consequential action in the app while withholding
+the evidence for it, so it gets obeyed blindly or ignored — both bad. Instead:
+
+```
+[HIGH] POLYCAB — Trend structure broke
+You marked this at ₹1,240 on a breakout above the 20-day high of ₹1,232.
+Price has now fallen to ₹1,148, below the 20-day low of ₹1,160 — the
+structure that justified the entry no longer holds.
+Consider exiting — decision support, not an instruction. The call is yours.
+```
+
+The word "sell" appears nowhere in the codebase's output. Severity is high for
+stop-loss/structure/target, medium for thesis break, low for volume dry-up and
+time stop. Alerts are deduped per rule per holding.
+
+## Move potential, confidence, and exit targets
+Three numbers per signal: how far this could run, how much is already gone, and
+how much the evidence supports. All **estimates derived from that stock's own
+history**, never predictions.
+
+- **Potential** scans the stock's past for setups of the same shape and measures
+  what followed (max favourable and adverse excursion), reports the 25th/50th/75th
+  percentiles, then caps against ATR and the nearest overhead level — naming which
+  one bit. Below **8 analogs no numeric range is shown at all**; a "typical move"
+  built on three examples is noise wearing a decimal point. When the typical move
+  has already happened, `exhausted: true` — the case a delayed feed creates often.
+- **Confidence (0–100)** returns its components, never a bare score: evidence
+  depth, analog consistency, how far past the thresholds the criteria cleared,
+  liquidity, data freshness, event risk, structure headroom. Long term is judged
+  on its criteria alone, since it has no move estimate by design.
+- **Exits** give safe / primary / stretch / stop, each with reasoning, plus
+  risk:reward against the stop. Below 1:1 is flagged explicitly. When resistance
+  sits close overhead the three tiers collapse and it says so, rather than
+  dressing one level up as three. The `suggestion` reasons from the numbers and
+  never instructs — "the evidence favours", never "you should".
+
+Stored on every signal, so `/signals/stats` can eventually answer the only
+question that matters: **did confidence and potential correlate with what
+happened?** It reports outcomes by confidence band and the hit rate of each exit
+level. If high-confidence signals do not outperform low-confidence ones, that
+shows up there rather than being quietly buried.
+
+## Events, sizing, concentration, and the morning brief
+- `GET /events` — best-effort results/ex-dividend dates scraped alongside
+  fundamentals. **When a date cannot be established, nothing is stored** — a
+  guessed date is worse than none, because it would let the app claim "no event
+  risk" about a stock reporting tomorrow. Signals within 3 sessions of an event
+  carry an `eventWarning`.
+- `GET /sizing?symbol=&entry=&stop=` sizes from risk, not from capital:
+  `(entry − stop) × qty ≈ capital × riskPerTradePct`. With no stop it assumes one
+  and says so loudly. `POST /sizing/config { capital, riskPerTradePct }`.
+- `GET /concentration` — exposure by sector, largest position, and the
+  "six positions, one bet" warning when several holdings share a sector. States
+  what it cannot see: holdings without quantity, and symbols with no sector.
+- `GET /brief` — one object for "what do I need to know today", and a Telegram
+  version at **08:45 IST on weekdays** (configurable via `briefTime`, using the
+  same timezone-correct IST logic as the keep-alive). Ordered by what costs money
+  soonest: exit signals, then new signals by profile, then IPOs closing, then
+  events. **An empty brief is still sent** — silence must always mean breakage,
+  never emptiness. `POST /brief/send` to fire one on demand.
+
 ## Watchlists
 `universe.json` may be a flat list or `{ "groups": { "Default": [...] } }`. A flat
 file migrates into `Default` on first load, and the `/universe` routes keep

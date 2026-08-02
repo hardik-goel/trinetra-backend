@@ -16,8 +16,27 @@ services:
         value: yahooDelayed
       - key: REFRESH_MS
         value: "60000"
-      # Set to this service's own deployed URL to keep it awake during
-      # market hours, e.g. https://trinetra-backend-tukc.onrender.com
-      # Leave unset to disable the pinger (instance sleeps on idle).
+      # Everything below is managed in the Render dashboard. `sync: false` means
+      # "this blueprint declares the key but never supplies the value" — a
+      # blueprint apply leaves whatever is set there alone. A literal value: ""
+      # would blank the dashboard value on every apply, silently disarming the
+      # pinger or the alerts it wiped.
+
+      # This service's own deployed URL, e.g.
+      # https://trinetra-backend-tukc.onrender.com — keeps the instance awake
+      # through market hours. Unset disables the pinger (sleeps on idle).
       - key: SELF_URL
-        value: ""
+        sync: false
+
+      # Kronos forecast microservice, e.g. https://trinetra-oracle.onrender.com
+      # Unset leaves the AI Forecast criterion reading "no data".
+      - key: ORACLE_URL
+        sync: false
+
+      # Telegram alerts. Set BOTH to arm alerts durably — they survive a
+      # redeploy, unlike credentials pushed from the dashboard's Alerts panel.
+      # Unset leaves alerts awaiting config, exactly as before.
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

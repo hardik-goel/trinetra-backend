@@ -220,6 +220,33 @@ that is why a failure degrades to `partial`/`unavailable` instead of guessing.
    `https://api.telegram.org/bot<TOKEN>/getUpdates` → copy your chat id.
 3. Paste both into the dashboard → Alerts → Arm. Alerts now run server-side.
 
+**Make them survive a redeploy.** Credentials pushed from the Alerts panel live
+only in the running instance, so an ephemeral host drops them on every redeploy
+and alerts stop without announcing it. Set them as env vars instead and they are
+seeded at every startup:
+
+| env var | purpose |
+|---------|---------|
+| `TELEGRAM_BOT_TOKEN` | bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | your chat id |
+
+Both must be set for the seed to apply; either one alone is ignored. Env wins at
+startup and arms alerts; the Alerts panel still overrides for the life of the
+process, and the next restart falls back to env. With neither, behaviour is
+unchanged — no alerts, no crash. Startup logs which of the three applies:
+
+```
+[alerts] telegram: from env | from saved config | awaiting config
+```
+
+Declared in `render.yaml` with `sync: false`, meaning the blueprint names the key
+but never supplies a value, so a blueprint apply can never blank what you set in
+the dashboard. `SELF_URL` and `ORACLE_URL` are declared the same way.
+
+> The token is part of `GET /config`, which is how the dashboard reads its own
+> settings. Lock `UI_ORIGIN` to your dashboard's origin in production — with the
+> default `*`, any site can read that response.
+
 ## Order-book depth on free feeds
 Buyers/sellers % needs paid exchange depth — no free source has it. The
 Order-flow criterion ships **disabled**; the dashboard shows NO DATA rather

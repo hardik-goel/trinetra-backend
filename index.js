@@ -121,6 +121,26 @@ const CONFIG_PATH = path.join(__dirname, "config.json");
 let config = fs.existsSync(CONFIG_PATH) ? read("config.json") : read("config.default.json");
 const saveConfig = () => { try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2)); } catch {} };
 
+/* Telegram credentials from the environment are the durable default. The
+   dashboard's "Save to backend" writes only to this instance, so a redeploy on
+   an ephemeral host wipes them and alerts stop without saying so. Env values
+   are seeded at startup and win over anything on disk; a POST still overrides
+   them for the life of the process, and the next restart falls back to env. */
+const envTelegram = () => {
+  const token = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+  const chatId = (process.env.TELEGRAM_CHAT_ID || "").trim();
+  return token && chatId ? { on: true, token, chatId } : null;
+};
+
+const seededTelegram = envTelegram();
+if (seededTelegram) config = { ...config, alerts: { ...config.alerts, telegram: seededTelegram } };
+const tg = config.alerts?.telegram;
+console.log(
+  `[alerts] telegram: ${seededTelegram ? "from env"
+    : tg?.token && tg?.chatId ? "from saved config"
+    : "awaiting config"}`
+);
+
 let snapshot = { at: 0, data: [] };
 let signalLog = [];
 const firedToday = new Set();

@@ -865,10 +865,20 @@ async function buildBrief() {
         const j = await r.json();
         const rows = Array.isArray(j) ? j : j.ipos || j.data || [];
         const soon = Date.now() + 2 * 86_400_000;
+        // Pravesh publishes close_date (snake) and keeps the call in
+        // take.verdict_key with a one-liner worth carrying into the brief.
         ipos = rows.filter(x => {
           const close = Date.parse(x.closeDate || x.close_date || "");
           return Number.isFinite(close) && close >= Date.now() - 86_400_000 && close <= soon;
-        }).map(x => ({ name: x.name || x.ipoName, verdict: x.verdict || x.call, closeDate: x.closeDate || x.close_date }));
+        }).map(x => ({
+          name: x.name || x.ipoName,
+          verdict: x.take?.verdict_key || x.verdict || x.call || null,
+          verdictLabel: x.take?.verdict_label || null,
+          oneLiner: x.take?.one_liner || null,
+          segment: x.segment || null,
+          closeDate: x.closeDate || x.close_date,
+          closingTomorrow: !!x.closing_tomorrow,
+        }));
       }
     }
   } catch { /* degrade silently — the brief is still worth sending */ }

@@ -3,6 +3,8 @@
    (e.g. polycab.in). This is EOD/delayed, ideal for swing setups.
    No intraday and no order-book depth (Kite-only). */
 
+const MAX_DAY_MOVE = 0.25; // >25% between two EOD closes is a data artifact, not a move
+
 async function fetchCsv(symbol) {
   // d1 = daily interval, i=d
   const url = `https://stooq.com/q/d/l/?s=${symbol.toLowerCase()}.in&i=d`;
@@ -12,11 +14,18 @@ async function fetchCsv(symbol) {
   const lines = text.trim().split("\n");
   if (lines.length < 3 || lines[0].startsWith("<")) throw new Error(`${symbol}: no data`);
   // header: Date,Open,High,Low,Close,Volume
-  const rows = lines.slice(1).map(l => l.split(",")).filter(c => c.length >= 6 && c[4] !== "");
+  // Drop unparseable/blank closes here so closes and vols stay index-aligned.
+  const rows = lines.slice(1).map(l => l.split(","))
+    .filter(c => c.length >= 6 && Number.isFinite(+c[4]) && +c[4] > 0);
+  if (!rows.length) throw new Error(`${symbol}: no valid closes`);
   const closes = rows.map(c => +c[4]);
   const vols = rows.map(c => +c[5]);
   const price = closes.at(-1);
-  const prevClose = closes.at(-2) ?? price;
+  let prevClose = closes.at(-2) ?? price;
+  if (Math.abs(price - prevClose) / prevClose > MAX_DAY_MOVE) {
+    console.warn(`[stooqEod] ${symbol}: implausible day move — price ${price} vs prevClose ${prevClose}; clamping to 0%`);
+    prevClose = price;
+  }
   const last20 = closes.slice(-21, -1);
   const vol20 = vols.slice(-21, -1);
   return {

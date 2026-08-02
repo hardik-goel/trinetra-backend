@@ -20,20 +20,84 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { yahooDelayed } from "./providers/yahooDelayed.js";
 import { stooqEod } from "./providers/stooqEod.js";
-// import { kite } from "./providers/kite.js";
+import { kite } from "./providers/kite.js";
 import { evaluate } from "./lib/engine.js";
 import { notify } from "./lib/alerts.js";
 import { getForecasts, mergeForecasts } from "./lib/oracle.js";
+import { startKeepAlive } from "./lib/keepalive.js";
+import { fetchFundamentals } from "./lib/fundamentals.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = f => JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8"));
 
 const PROVIDER = process.env.PROVIDER || "stooqEod";
 const REFRESH_MS = +(process.env.REFRESH_MS || 60_000);
-const SYMBOLS = read("universe.json");
 const FUNDAMENTALS = read("fundamentals.json");
 
-const providers = { stooqEod, yahooDelayed /*, kite */ };
+// The universe is editable from the dashboard. A runtime copy wins over the
+// committed list when present; same ephemeral caveat as config.json — Render
+// free wipes it on redeploy and the UI re-pushes.
+const UNIVERSE_PATH = path.join(__dirname, "universe.runtime.json");
+const MAX_SYMBOLS = 200;
+const SYMBOL_RE = /^[A-Z0-9&-]+$/; // NSE symbol charset
+let SYMBOLS = fs.existsSync(UNIVERSE_PATH) ? read("universe.runtime.json") : read("universe.json");
+
+// One normalizer behind every /universe endpoint: trim, uppercase, drop
+// anything off-charset, dedupe, cap. Order of first appearance is kept.
+function cleanSymbols(list) {
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const s = String(raw ?? "").trim().toUpperCase();
+    if (!s || !SYMBOL_RE.test(s) || out.includes(s)) continue;
+    out.push(s);
+    if (out.length >= MAX_SYMBOLS) break;
+  }
+  return out;
+}
+
+SYMBOLS = cleanSymbols(SYMBOLS); // a hand-edited file gets the same treatment
+const saveUniverse = () => { try { fs.writeFileSync(UNIVERSE_PATH, JSON.stringify(SYMBOLS, null, 2)); } catch {} };
+
+// Scraped fundamentals, cached because they only move quarterly. The committed
+// fundamentals.json stays as the durable seed underneath — same ephemeral
+// caveat as the universe on Render free.
+const FUND_CACHE_PATH = path.join(__dirname, "fundamentals.cache.json");
+const FUND_FIELDS = ["roe", "de", "profitGrowth", "promoter", "pledged"];
+let fundCache = fs.existsSync(FUND_CACHE_PATH) ? read("fundamentals.cache.json") : {};
+const saveFundCache = () => { try { fs.writeFileSync(FUND_CACHE_PATH, JSON.stringify(fundCache, null, 2)); } catch {} };
+
+// The engine reads this merged view: a scraped value wins, and the hand-entered
+// seed fills any field the scrape could not establish. Status always reports
+// what the scrape actually managed, so a stock is never silently "complete".
+// Seed-only records are tagged so the engine can refuse to lock on them and the
+// UI can say where the numbers came from. A scrape has never confirmed these.
+const fundFor = sym => {
+  const cached = fundCache[sym], seed = FUNDAMENTALS[sym];
+  if (!cached) return seed ? { ...seed, status: "seed", source: "committed seed" } : null;
+  const merged = { ...(seed || {}) };
+  for (const f of FUND_FIELDS) if (cached[f] != null) merged[f] = cached[f];
+  return { ...merged, status: cached.status, source: cached.source, fetchedAt: cached.fetchedAt };
+};
+
+const strip = r => ({ roe: r.roe, de: r.de, profitGrowth: r.profitGrowth, promoter: r.promoter, pledged: r.pledged, status: r.status, source: r.source, fetchedAt: r.fetchedAt });
+const fundInflight = new Set();
+// Fire-and-forget: adding a symbol must not wait on a scrape.
+function ensureFundamentals(symbols) {
+  for (const s of symbols) {
+    if (fundCache[s] || fundInflight.has(s)) continue;
+    fundInflight.add(s);
+    fetchFundamentals(s)
+      .then(rec => {
+        fundCache[s] = strip(rec); saveFundCache();
+        applyFund([s]);
+        console.log(`[fundamentals] ${s}: ${rec.status}${rec.source ? " via " + rec.source : ""}${rec.missing.length ? " · missing " + rec.missing.join(",") : ""}`);
+      })
+      .catch(e => console.warn(`[fundamentals] ${s}: ${e.message}`))
+      .finally(() => fundInflight.delete(s));
+  }
+}
+
+const providers = { stooqEod, yahooDelayed, kite };
 const provider = providers[PROVIDER];
 if (!provider) throw new Error(`Unknown PROVIDER "${PROVIDER}"`);
 
@@ -48,6 +112,16 @@ let signalLog = [];
 const firedToday = new Set();
 let lastDay = new Date().toDateString();
 
+// A scrape lands between refresh ticks. Without this the served snapshot keeps
+// the pre-scrape numbers for up to REFRESH_MS while the status already reads
+// "complete" — the UI would show fresh provenance over stale values.
+function applyFund(symbols) {
+  if (!snapshot.data.length) return;
+  const touched = new Set(symbols);
+  snapshot = { ...snapshot, data: snapshot.data.map(q => touched.has(q.symbol) ? { ...q, fund: fundFor(q.symbol) } : q) };
+  scan(); // fresher fundamentals can lock or unlock a gate
+}
+
 async function refresh() {
   // reset the per-day dedupe at date rollover
   const today = new Date().toDateString();
@@ -57,7 +131,7 @@ async function refresh() {
     const quotes = await provider(SYMBOLS);
     const forecasts = await getForecasts(SYMBOLS);
     const enriched = mergeForecasts(quotes, forecasts);
-    snapshot = { at: Date.now(), data: enriched.map(q => ({ ...q, fund: FUNDAMENTALS[q.symbol] || null })) };
+    snapshot = { at: Date.now(), data: enriched.map(q => ({ ...q, fund: fundFor(q.symbol) })) };
     console.log(`[trinetra] ${snapshot.data.length} symbols via ${PROVIDER}`);
     scan();
   } catch (e) {
@@ -95,6 +169,93 @@ app.get("/snapshot", (_, res) =>
 
 app.get("/signals", (_, res) => res.json(signalLog));
 
+app.get("/universe", (_, res) => res.json({ symbols: SYMBOLS }));
+
+// Replace the whole list. An empty array is legal — that is "Clear all".
+app.post("/universe", (req, res) => {
+  if (!Array.isArray(req.body?.symbols)) return res.status(400).json({ error: "symbols must be an array" });
+  const before = new Set(SYMBOLS);
+  SYMBOLS = cleanSymbols(req.body.symbols);
+  saveUniverse();
+  ensureFundamentals(SYMBOLS.filter(s => !before.has(s)));
+  refresh(); // not awaited — the caller gets the list now, quotes land next tick
+  res.json({ symbols: SYMBOLS });
+});
+
+app.post("/universe/add", (req, res) => {
+  const [symbol] = cleanSymbols([req.body?.symbol]);
+  if (!symbol) return res.status(400).json({ error: "invalid symbol" });
+  if (!SYMBOLS.includes(symbol)) {
+    if (SYMBOLS.length >= MAX_SYMBOLS) return res.status(400).json({ error: `universe is full (max ${MAX_SYMBOLS})` });
+    SYMBOLS = [...SYMBOLS, symbol];
+    saveUniverse();
+    ensureFundamentals([symbol]);
+    refresh();
+  }
+  res.json({ symbols: SYMBOLS });
+});
+
+app.post("/universe/remove", (req, res) => {
+  const [symbol] = cleanSymbols([req.body?.symbol]);
+  if (!symbol) return res.status(400).json({ error: "invalid symbol" });
+  if (SYMBOLS.includes(symbol)) {
+    SYMBOLS = SYMBOLS.filter(s => s !== symbol);
+    saveUniverse();
+  }
+  res.json({ symbols: SYMBOLS });
+});
+
+app.post("/universe/bulk-add", (req, res) => {
+  if (!Array.isArray(req.body?.symbols)) return res.status(400).json({ error: "symbols must be an array" });
+  const had = new Set(SYMBOLS);
+  const before = SYMBOLS.length;
+  // Existing symbols go first, so an over-cap paste is what gets dropped.
+  SYMBOLS = cleanSymbols([...SYMBOLS, ...cleanSymbols(req.body.symbols)]);
+  const added = SYMBOLS.length - before;
+  if (added) { saveUniverse(); ensureFundamentals(SYMBOLS.filter(s => !had.has(s))); refresh(); }
+  res.json({ symbols: SYMBOLS, added, skipped: req.body.symbols.length - added });
+});
+
+app.post("/universe/bulk-remove", (req, res) => {
+  if (!Array.isArray(req.body?.symbols)) return res.status(400).json({ error: "symbols must be an array" });
+  const drop = new Set(cleanSymbols(req.body.symbols));
+  const before = SYMBOLS.length;
+  SYMBOLS = SYMBOLS.filter(s => !drop.has(s));
+  const removed = before - SYMBOLS.length;
+  if (removed) saveUniverse();
+  res.json({ symbols: SYMBOLS, removed });
+});
+
+app.get("/fundamentals", (_, res) => res.json(fundCache));
+
+app.post("/fundamentals/refresh", async (req, res) => {
+  const [symbol] = cleanSymbols([req.body?.symbol]);
+  if (!symbol) return res.status(400).json({ error: "invalid symbol" });
+  const rec = await fetchFundamentals(symbol);
+  fundCache[symbol] = strip(rec);
+  saveFundCache();
+  applyFund([symbol]);
+  res.json(fundCache[symbol]);
+});
+
+// Sequential and paced — a burst of parallel scrapes is how you get blocked.
+// Note this responds only when the whole universe is done (~1s per symbol).
+app.post("/fundamentals/refresh-all", async (_, res) => {
+  const summary = { refreshed: 0, partial: 0, unavailable: 0 };
+  for (const s of SYMBOLS) {
+    const rec = await fetchFundamentals(s);
+    fundCache[s] = strip(rec);
+    if (rec.status === "fetched") summary.refreshed++;
+    else if (rec.status === "partial") summary.partial++;
+    else summary.unavailable++;
+    saveFundCache();
+    applyFund([s]);
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  console.log(`[fundamentals] refresh-all: ${JSON.stringify(summary)}`);
+  res.json(summary);
+});
+
 app.get("/config", (_, res) => res.json(config));
 app.post("/config", (req, res) => {
   const { criteria, alerts } = req.body || {};
@@ -109,5 +270,10 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`[trinetra] listening :${PORT} · provider=${PROVIDER}`);
   await refresh();
+  // Anything still on seed values gets scraped now, so an unverified gate is a
+  // state the instrument passes through rather than one it sits in.
+  ensureFundamentals(SYMBOLS);
   setInterval(refresh, REFRESH_MS);
+  // Only on hosts that sleep on idle — unset SELF_URL leaves everything as-is.
+  if (process.env.SELF_URL) startKeepAlive(process.env.SELF_URL);
 });

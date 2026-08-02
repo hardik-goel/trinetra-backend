@@ -10,3 +10,8 @@ services:
         value: yahooDelayed
       - key: REFRESH_MS
         value: "60000"
+      # Set to this service's own deployed URL to keep it awake during
+      # market hours, e.g. https://trinetra-backend-tukc.onrender.com
+      # Leave unset to disable the pinger (instance sleeps on idle).
+      - key: SELF_URL
+        value: ""

@@ -1,0 +1,15 @@
+# deps
+node_modules/
+
+# secrets — .env.example is the committed template
+.env
+
+# runtime state, written by the server at run time. The committed seeds
+# (universe.json, fundamentals.json, config.default.json) are the durable
+# versions; these are per-deploy and wiped on Render's free tier anyway.
+universe.runtime.json
+fundamentals.cache.json
+config.json
+
+# macOS
+.DS_Store

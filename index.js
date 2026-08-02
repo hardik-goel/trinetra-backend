@@ -23,7 +23,7 @@ import { stooqEod } from "./providers/stooqEod.js";
 import { kite } from "./providers/kite.js";
 import { evaluate } from "./lib/engine.js";
 import { notify } from "./lib/alerts.js";
-import { getForecasts, mergeForecasts } from "./lib/oracle.js";
+import { cachedForecasts, ensureForecasts, mergeForecasts } from "./lib/oracle.js";
 import { startKeepAlive } from "./lib/keepalive.js";
 import { fetchFundamentals } from "./lib/fundamentals.js";
 import { METRIC_KEYS } from "./fundamentals.config.js";
@@ -143,14 +143,28 @@ async function refresh() {
 
   try {
     const quotes = await provider(SYMBOLS);
-    const forecasts = await getForecasts(SYMBOLS);
-    const enriched = mergeForecasts(quotes, forecasts);
+    // Merge whatever forecasts are known now — a sleeping Oracle must never
+    // hold up a market refresh. The fetch runs in the background and re-merges
+    // into the published snapshot the moment it lands.
+    const enriched = mergeForecasts(quotes, cachedForecasts());
     snapshot = { at: Date.now(), data: enriched.map(q => ({ ...q, fund: fundFor(q.symbol) })) };
-    console.log(`[trinetra] ${snapshot.data.length} symbols via ${PROVIDER}`);
+    const withFcst = snapshot.data.filter(q => q.fcst).length;
+    console.log(`[trinetra] ${snapshot.data.length} symbols via ${PROVIDER} · ${withFcst} with a forecast`);
     scan();
+    ensureForecasts(SYMBOLS, applyForecasts);
   } catch (e) {
     console.error("[trinetra] refresh failed:", e.message);
   }
+}
+
+// Forecasts arriving between refresh ticks re-merge into the live snapshot, so
+// /snapshot reflects them immediately rather than at the next cycle.
+function applyForecasts(forecasts) {
+  if (!snapshot.data.length) return;
+  snapshot = { ...snapshot, data: mergeForecasts(snapshot.data, forecasts) };
+  const withFcst = snapshot.data.filter(q => q.fcst).length;
+  console.log(`[oracle] merged into snapshot · ${withFcst}/${snapshot.data.length} stocks carry an fcst`);
+  scan(); // a forecast can complete a confluence
 }
 
 function scan() {

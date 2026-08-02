@@ -3,6 +3,12 @@ services:
     name: trinetra-backend
     runtime: node
     plan: free
+    # Deploy every push to the tracked branch. Without this a push lands in
+    # GitHub and the running instance keeps serving the old commit — which is
+    # exactly how /fundamentals and /universe 404'd on a deployed build whose
+    # source had them.
+    autoDeploy: true
+    branch: master
     buildCommand: npm install
     startCommand: npm start
     envVars:

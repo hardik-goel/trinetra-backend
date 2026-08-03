@@ -54,6 +54,7 @@ import { trendIntact as trendOf } from "./lib/indicators.js";
 import { analyse as analyseCandlesFor } from "./lib/candles.js";
 import { candidates as levelCandidatesFor } from "./lib/levels.js";
 import { build as buildPlaybook } from "./lib/playbook.js";
+import * as remote from "./lib/remoteStore.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = f => JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8"));
@@ -89,7 +90,13 @@ function cleanSymbols(list) {
    operating on that group, so the old shape keeps working. */
 let GROUPS = migrateGroups(RAW_UNIVERSE, cleanSymbols);
 let SYMBOLS = unionGroups(GROUPS, cleanSymbols);
-const saveUniverse = () => { try { fs.writeFileSync(UNIVERSE_PATH, JSON.stringify({ groups: GROUPS }, null, 2)); } catch {} };
+const saveUniverse = () => {
+  try {
+    fs.writeFileSync(UNIVERSE_PATH, JSON.stringify({ groups: GROUPS }, null, 2));
+    // The edited symbol list is the thing most obviously lost on a redeploy.
+    remote.markDirty("universe.runtime.json");
+  } catch {}
+};
 
 // Every mutation funnels through here: recompute the scan set, persist, and
 // re-tag the live snapshot. Re-tagging matters even when no refresh follows —
@@ -190,7 +197,14 @@ if (!provider) throw new Error(`Unknown PROVIDER "${PROVIDER}"`);
 // hosts (Render free) it resets on redeploy — the UI re-pushes it.
 const CONFIG_PATH = path.join(__dirname, "config.json");
 let config = fs.existsSync(CONFIG_PATH) ? read("config.json") : read("config.default.json");
-const saveConfig = () => { try { fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2)); } catch {} };
+const saveConfig = () => {
+  try {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+    // Criteria, thresholds, sizing and exit rules are hand-tuned and worth
+    // keeping. The Telegram token in here is stripped before it is ever encoded.
+    remote.markDirty("config.json");
+  } catch {}
+};
 
 /* Telegram credentials from the environment are the durable default. The
    dashboard's "Save to backend" writes only to this instance, so a redeploy on
@@ -888,7 +902,19 @@ console.log(`[cors] ${UI_ORIGIN === "*"
 app.use(express.json());
 
 app.get("/health", (_, res) =>
-  res.json({ ok: true, provider: PROVIDER, lastRefresh: snapshot.at, symbols: snapshot.data.length, delayed: PROVIDER === "yahooDelayed" }));
+  res.json({ ok: true, provider: PROVIDER, lastRefresh: snapshot.at, symbols: snapshot.data.length,
+             delayed: PROVIDER === "yahooDelayed",
+             // Whether this instance's data survives a redeploy. Surfaced here
+             // because "ephemeral" is a thing to be told, not to discover.
+             storage: remote.status() }));
+
+/* Storage detail and a manual flush, for when the user wants to be certain
+   something is safely off this instance before redeploying. */
+app.get("/storage", (_, res) => res.json({ ...remote.status(), tracked: remote.trackedFiles() }));
+app.post("/storage/flush", async (_, res) => {
+  try { res.json({ ok: true, ...(await remote.flush("manual")), status: remote.status() }); }
+  catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+});
 
 app.get("/snapshot", (_, res) =>
   res.json({
@@ -1718,6 +1744,40 @@ app.post("/config", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`[trinetra] listening :${PORT} · provider=${PROVIDER}`);
+
+  /* Pull anything this disk is missing BEFORE the first scan. On Render's free
+     plan a redeploy arrives with an empty data/, so this is the step that turns
+     a wipe into a non-event. Only absent files are adopted — a local file always
+     wins, because replacing a live trade log with an older snapshot is a worse
+     failure than a stale remote. */
+  const boot = await remote.bootstrap().catch(e => ({ enabled: false, adopted: [], reason: e.message }));
+  if (boot.adopted?.length) {
+    // Re-read: the modules loaded their files at import time, before the pull.
+    history.reload(); paper.reload(); ipo.reload(); holdings.reload();
+    analysts.reload(); events.reload?.();
+    if (boot.adopted.includes("universe.runtime.json")) {
+      try {
+        GROUPS = migrateGroups(read("universe.runtime.json"), cleanSymbols);
+        SYMBOLS = unionGroups(GROUPS, cleanSymbols);
+        console.log(`[remote] universe adopted — ${SYMBOLS.length} symbols`);
+      } catch (e) { console.warn(`[remote] universe adopt failed: ${e.message}`); }
+    }
+    if (boot.adopted.includes("config.json")) {
+      try {
+        const restored = read("config.json");
+        // Credentials come from the environment every boot and are never in the
+        // remote copy, so the live ones must survive adoption.
+        const { alerts: _dropped, ...rest } = restored;
+        config = { ...config, ...rest, alerts: config.alerts };
+        if (restored.profiles) config.profiles = migrateProfiles(restored);
+        console.log("[remote] config adopted — criteria and thresholds restored");
+      } catch (e) { console.warn(`[remote] config adopt failed: ${e.message}`); }
+    }
+  }
+  const st = remote.status();
+  console.log(`[storage] ${st.mode} — ${st.detail}`);
+  remote.installShutdownFlush();
+
   const hol = gate.loadHolidays();
   gate.loadLedger();
   console.log(hol

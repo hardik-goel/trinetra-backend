@@ -391,6 +391,30 @@ one: "Download backup" before a deploy, "Restore from file" after.
 var unset both return **503** rather than serving — they expose and can destroy
 the whole trading record, and CORS does not protect a non-browser caller.
 
+### `GET /health` — `storage`, and `GET /storage` · `POST /storage/flush`
+
+Whether this instance's data survives a redeploy. Surfaced on `/health` because
+"ephemeral" is something to be told, not to discover.
+
+```json
+"storage": { "mode": "durable" | "degraded" | "ephemeral", "durable": true,
+             "repo": "owner/name", "branch": "main",
+             "lastPushAt": 1754..., "pushes": 8, "failures": 0,
+             "pendingFiles": [], "adoptedAtBoot": [ … ],
+             "detail": "…", "fix": "…" }
+```
+
+Render a banner on anything other than `"durable"`:
+
+- `"ephemeral"` — nothing configured. Everything is lost on the next redeploy.
+  `fix` carries the two env vars to set.
+- `"degraded"` — configured, but the last push failed. `pendingFiles` exists only
+  on that instance's disk. `POST /storage/flush` retries and returns the new status.
+
+`GET /storage` is the same object plus `tracked[]`, the file list.
+
+---
+
 ### `GET /alerts/status`
 ```json
 { "windowOpen": false, "reason": "after close", "tradingDay": "2026-08-03",

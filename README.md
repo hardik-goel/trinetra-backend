@@ -72,6 +72,54 @@ Two gotchas worth knowing up front:
   was verified: two stocks with identical passing fundamentals, differing only in
   `status`, so the gate was the single variable.
 
+## Surviving a redeploy without paying for a disk
+
+Render's free plan has no persistent disk. Every redeploy wipes `data/`, and with
+it the signal history, the alert ledger, the hand-typed analyst calls, the edited
+universe and the tuned criteria. The fix is a **private GitHub repo as the store**.
+
+Set two environment variables:
+
+| var | value |
+|---|---|
+| `DATA_REPO` | `owner/name` of a **private** repo, e.g. `hardik-goel/trinetra-data` |
+| `DATA_REPO_TOKEN` | fine-grained PAT, **Contents: read and write**, scoped to that repo only |
+
+Optional: `DATA_BRANCH` (default `main`), `DATA_FLUSH_MS` (default 10000).
+
+The repo must exist and have at least one commit — create it with a README and
+nothing else. Do not reuse the pravesh PAT: that one is scoped to `pravesh-engine`
+with Actions permissions and has no business writing here.
+
+**How it behaves**
+
+- Local disk stays the working copy. Every read is local; nothing pays a network
+  round-trip, so a rate-limited or slow API can never slow the scan loop.
+- Writes are debounced (~10s) and coalesced. `signal_history.json` is written on
+  every scan, and one commit per write would be thousands a day.
+- At boot it adopts any tracked file this disk is **missing**. A file that exists
+  locally always wins — replacing a live trade log with an older snapshot is a far
+  worse failure than a stale remote.
+- First boot against an empty repo **seeds** it from local disk. Without that, a
+  file that is only written when it changes — the alert ledger, the analyst calls —
+  would sit on an ephemeral disk untouched and therefore unbacked-up, until the
+  redeploy that deletes it.
+- `SIGTERM` triggers a final flush, which is what Render sends on redeploy.
+
+**Every write is a commit, so the version history is the backup history.** When a
+symbol was added is answerable, and `git revert` is a restore.
+
+**Telegram credentials are stripped before the file is encoded**, exactly as
+`/backup` strips them. They come from the environment on every boot and do not
+need to survive in a file; a private repo is still one more place a token could be
+read from.
+
+**It fails loudly.** If GitHub is unreachable the app runs exactly as it does
+without any of this, but `GET /health` reports `storage.mode: "degraded"` with the
+pending files, and `POST /storage/flush` retries. With nothing configured the mode
+is `"ephemeral"` and says plainly what will be lost. A store that quietly stops
+persisting is worse than no store, because you would trust it.
+
 ## The original four
 The app was commissioned against four criteria, and they are pinned in the engine
 so the display can never drift from what actually runs. `GET /profiles` returns

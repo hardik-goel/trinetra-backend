@@ -72,6 +72,52 @@ Two gotchas worth knowing up front:
   was verified: two stocks with identical passing fundamentals, differing only in
   `status`, so the gate was the single variable.
 
+## The three criteria, and why the eye was not opening
+The instrument exists for three checks — **fundamentals, breakout, volume
+shocker** — and the eye opens when all three lock. They are defined once, in
+`lib/profiles.js` as `CANONICAL_CRITERIA`, used whenever no valid config exists,
+and restorable with `POST /criteria/restore-defaults`. `GET /profiles` reports
+`matchesCanonical` so the dashboard can offer a one-tap restore when they differ.
+Defaults are a floor, not a cage: override freely.
+
+**Root cause of the silent failure: volume was compared against the wrong
+denominator.** Yahoo's daily bar reports volume *accumulated so far*, so at 11:38
+IST — 38% through the session — it holds about a third of a day. That was being
+divided by a 20-day **full-day** average, so a 3× threshold needed roughly 8×
+pace to trip before lunch. It was effectively unreachable until the close:
+
+```
+POLYCAB  raw 0.13x → paced 0.35x     BEL  raw 0.31x → paced 0.79x
+JPPOWER  raw 1.64x → paced 4.22x   ← clears a 3x threshold; raw never would
+```
+
+Volume is now pro-rated by how much of the session has elapsed, so 3× means 3× the
+pace. Completed sessions compare directly, as before.
+
+### A criterion with no data can never veto a signal
+This rule outranks every threshold. A check whose metric is unavailable is
+**skipped, not failed**:
+
+- **Order Flow** needs Kite. **AI Forecast** is parked. Both ship disabled, and a
+  migration or a `/config` sync can no longer switch them on — but even if one is
+  enabled, it is excluded from the lock and named in `evaluation.warnings`.
+  Previously, enabling either would read NO DATA and block every signal forever
+  with nothing saying why.
+- **A missing metric is not a failed metric.** "Pledged: unknown" is not "pledged:
+  too high". The criterion is judged on what is known and reports what it skipped
+  (`partial: true`).
+
+The cost is real and stated rather than hidden: a criterion whose data is entirely
+missing drops out of the lock, so a stock can lock on the rest. `evaluation.skipped`
+names those, and the UI is expected to show it — "locked" then means "locked on
+what could be measured".
+
+**Seed fundamentals are treated the same way.** Hand-entered values that no scrape
+has confirmed no longer fail the criterion; they exclude it, with a warning. That
+is a deliberate reversal of the earlier behaviour, where unverified values vetoed
+the gate and an unscraped stock could never fire. Startup scrapes the universe, so
+`seed` is a state the instrument passes through rather than sits in.
+
 ## Criteria profiles (multi-horizon)
 One criteria set forced one answer to four different questions. There are now
 four profiles, each evaluated independently against every stock, each with its

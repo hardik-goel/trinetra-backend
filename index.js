@@ -39,7 +39,8 @@ import * as holdings from "./lib/holdings.js";
 import * as events from "./lib/events.js";
 import * as brief from "./lib/brief.js";
 import { evaluateAll as evaluateExits, DEFAULT_RULES as EXIT_RULES } from "./lib/exits.js";
-import { migrate as migrateProfiles, enabledProfiles, needsIntraday, cleanId, HORIZON_SESSIONS } from "./lib/profiles.js";
+import { migrate as migrateProfiles, enabledProfiles, needsIntraday, cleanId, HORIZON_SESSIONS,
+         CANONICAL_CRITERIA, matchesCanonical, DATALESS_CRITERIA } from "./lib/profiles.js";
 import { potential, confidence, exitLevels, atrPct } from "./lib/analysis.js";
 import { derive as deriveIntraday } from "./lib/intraday.js";
 import { suggest as suggestSize, concentration as computeConcentration, DEFAULT_SIZING } from "./lib/sizing.js";
@@ -294,6 +295,35 @@ function applyFund(symbols) {
   scan(); // fresher fundamentals can lock or unlock a gate
 }
 
+/* Yahoo's daily bar reports volume ACCUMULATED SO FAR, so mid-session it holds a
+   fraction of a day. Comparing that against a 20-day full-day average made the
+   volume criterion unreachable until near the close — the single reason the eye
+   was not opening. This pro-rates by how much of the session has elapsed, so a
+   3x threshold means 3x the pace rather than 3x the whole day by lunchtime. */
+function volumePace(q) {
+  const IST = 5.5 * 3600e3;
+  const now = new Date(Date.now() + IST);
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const OPEN = 9 * 60 + 15, CLOSE = 15 * 60 + 30;
+  const lastBar = q.candles?.at(-1);
+  const barIsToday = lastBar && new Date(lastBar.t + IST).toISOString().slice(0, 10) === now.toISOString().slice(0, 10);
+  const inSession = mins >= OPEN && mins <= CLOSE && now.getUTCDay() !== 0 && now.getUTCDay() !== 6;
+
+  if (!q.avgVol20) return { sessionFraction: null, volPaceMultiple: null, volumeIsPartial: false };
+  const raw = q.volToday / q.avgVol20;
+  if (!inSession || !barIsToday) {
+    // A completed session compares like with like already.
+    return { sessionFraction: 1, volPaceMultiple: +raw.toFixed(3), volumeIsPartial: false };
+  }
+  const frac = Math.max(0.05, Math.min(1, (mins - OPEN) / (CLOSE - OPEN)));
+  return {
+    sessionFraction: +frac.toFixed(3),
+    volPaceMultiple: +(raw / frac).toFixed(3),
+    volumeRawMultiple: +raw.toFixed(3),
+    volumeIsPartial: true,
+  };
+}
+
 async function refresh() {
   // reset the per-day dedupe at date rollover
   const today = new Date().toDateString();
@@ -309,6 +339,7 @@ async function refresh() {
       at: Date.now(),
       data: enriched.map(q => ({
         ...q,
+        ...volumePace(q),
         fund: fundFor(q.symbol),
         groups: groupsFor(GROUPS, q.symbol),
         intraday: q.intradayBars ? deriveIntraday(q.intradayBars) : null,
@@ -791,7 +822,25 @@ app.get("/ipo-applications/stats", async (req, res) =>
 
 /* ── profiles ────────────────────────────────────────────────────────────── */
 
-app.get("/profiles", (_, res) => res.json({ profiles: config.profiles }));
+app.get("/profiles", (_, res) => res.json({
+  profiles: config.profiles,
+  canonical: CANONICAL_CRITERIA,
+  // The dashboard shows a one-line banner when these differ, rather than
+  // silently overriding a user who meant to change them.
+  matchesCanonical: matchesCanonical(config.profiles?.swing?.criteria),
+}));
+
+/* One tap back to the instrument's original purpose: fundamentals, breakout,
+   volume shocker. Defaults are a floor, not a cage — this is available, never
+   automatic. */
+app.post("/criteria/restore-defaults", (req, res) => {
+  const id = cleanId(req.body?.profile || "swing");
+  const p = config.profiles[id];
+  if (!p) return res.status(404).json({ error: "no such profile" });
+  p.criteria = structuredClone(CANONICAL_CRITERIA);
+  saveConfig(); scan();
+  res.json({ ok: true, profile: id, criteria: p.criteria, matchesCanonical: true });
+});
 
 app.post("/profiles", (req, res) => {
   const id = cleanId(req.body?.id || req.body?.name);
@@ -1291,7 +1340,14 @@ app.post("/fundamentals/refresh-all", async (_, res) => {
 app.get("/config", (_, res) => res.json(publicConfig()));
 app.post("/config", (req, res) => {
   const { criteria, alerts } = req.body || {};
-  if (Array.isArray(criteria)) config.criteria = criteria;
+  /* A synced criteria array must not be able to switch on a criterion whose
+     data source is absent. Enabling Order Flow from the dashboard would
+     otherwise block every signal on a delayed feed — the engine now excludes it
+     from the lock regardless, but arriving already-disabled is clearer than
+     arriving broken and rescued. */
+  if (Array.isArray(criteria)) {
+    config.criteria = criteria.map(c => (DATALESS_CRITERIA.has(c.id) && c.enabled ? { ...c, enabled: false } : c));
+  }
   if (alerts) {
     config.alerts = {
       ...config.alerts, ...alerts,

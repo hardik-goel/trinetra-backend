@@ -670,12 +670,17 @@ function cycleContextFor(stock, holding) {
   };
 }
 
-function scanCycles() {
+/* `opts` exists so the same code path can be run without side effects, for the
+   preview endpoint. Nothing about how a signal is BUILT changes — only whether it
+   is committed, alerted and recorded. A preview that took a different path would
+   be verifying the preview rather than the thing. */
+function scanCycles(opts = {}) {
+  const commit = opts.commit !== false;
   const bySymbol = stockBySymbol();
   const out = { sell: [], buyBack: [], suppressed: [] };
   const sellP = config.profiles.sell_holdings, buyP = config.profiles.buyback_holdings;
 
-  for (const h of holdings.open()) {
+  for (const h of (opts.holdings || holdings.open())) {
     const stock = bySymbol[h.symbol];
     if (!stock) continue;
     const ctx = cycleContextFor(stock, h);
@@ -736,7 +741,7 @@ function scanCycles() {
 
     if (sellP?.enabled !== false) {
       const ev = evaluate(withCtx, sellP.criteria);
-      if (ev.locked) out.sell.push({
+      if (ev.locked || opts.force === "sell") out.sell.push({
         ...render(ev, "sell"),
         holding: {
           entryPrice: h.entryPrice, currentPrice: stock.price,
@@ -762,7 +767,7 @@ function scanCycles() {
           reason: "trend broken — no re-entry signal",
           detail: `Price ₹${stock.price} is below the 50-day average of ₹${trend.ma}. This is a falling knife, not a pullback.`,
         });
-      } else if (ev.locked) {
+      } else if (ev.locked || opts.force === "buyBack") {
         out.buyBack.push({
           ...render(ev, "buyBack"),
           belowSalePct: derived?.belowSalePct ?? null,
@@ -784,11 +789,16 @@ function scanCycles() {
     delete sig._ev; delete sig._price; delete sig._name; delete sig._groups;
   }
 
-  cycleSignals = {
+  const clean = {
     ...out,
     sell: out.sell.map(({ _raw, ...s }) => s),
     buyBack: out.buyBack.map(({ _raw, ...s }) => s),
   };
+
+  // A preview never fires an alert, never enters the track record, and never
+  // replaces the live set.
+  if (!commit) return clean;
+  cycleSignals = clean;
 
   for (const sig of [...out.sell, ...out.buyBack]) {
     if (!gate.isNewExit(sig.id + ":" + gate.tradingDay())) continue;
@@ -1245,6 +1255,46 @@ app.delete("/holdings/:id", (req, res) =>
    a rule that actually broke — the client should not have to remember to split
    on a flag to avoid offering "Mark closed" on a watch. */
 app.get("/cycle-signals", (_, res) => res.json({ ...cycleSignals, dataAge: dataAge() }));
+
+/* A real sell payload on demand, for wiring the SELL rendering before a sell has
+   ever fired.
+
+   Built by the SAME code path as a live signal, with only the criteria lock
+   bypassed — real prices, real levels from the real playbook, real labels. What it
+   is NOT is a signal: nothing is alerted, nothing enters the track record, and the
+   live set is untouched. `preview: true` and `notASignal` travel with it so it can
+   never be mistaken for one on screen. */
+app.get("/cycle-signals/preview", (req, res) => {
+  const symbol = String(req.query.symbol || "").trim().toUpperCase();
+  const kind = req.query.kind === "buyBack" ? "buyBack" : "sell";
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+
+  const stock = stockBySymbol()[symbol];
+  if (!stock) return res.status(404).json({ error: `${symbol} is not in the scanned universe` });
+
+  const held = holdings.open().find(h => h.symbol === symbol);
+  /* If it is not actually held, stand in a holding rather than refusing — the
+     point is to render the shape. The stand-in is declared, not hidden, because
+     `holding.gainPct` computed off an invented entry price is not a real number. */
+  const h = held || {
+    id: "preview", symbol, entryPrice: Math.round(stock.price * 0.8 * 100) / 100,
+    markedAt: new Date().toISOString(), cycle: null,
+  };
+
+  const out = scanCycles({ commit: false, holdings: [h], force: kind });
+  const sig = (kind === "sell" ? out.sell : out.buyBack)[0] || null;
+
+  res.json({
+    preview: true,
+    notASignal: "Built by the same code path as a live signal with the criteria lock bypassed. Prices, levels and labels are real; the fact that it fired is not. Never render this as a signal.",
+    syntheticHolding: !held ? { used: true, entryPrice: h.entryPrice,
+      caveat: `${symbol} is not in your holdings, so an entry price 20% below the current price was assumed. holding.gainPct here is fabricated — every other number is real.` } : { used: false },
+    kind, symbol,
+    signal: sig,
+    suppressed: out.suppressed,
+    dataAge: dataAge(),
+  });
+});
 
 /* One tap each. Quantity is optional — the hold itself records none, so the
    cycle works in percentage terms until a quantity is supplied at the moment it

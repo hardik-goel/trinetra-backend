@@ -722,6 +722,30 @@ Kept out of `/exit-signals`, whose `signals[]` already means "a rule fired, cons
 exiting fully". `criteria[]` includes failed and skipped entries — three of four is
 not four of four.
 
+### `GET /cycle-signals/preview?symbol=&kind=sell|buyBack`
+
+A real SELL payload on demand, for wiring the sell rendering before a sell has ever
+fired. Built by the **same code path** as a live signal with only the criteria lock
+bypassed — real prices, real levels from the real playbook, real labels. A preview
+that took a different path would verify the preview rather than the thing.
+
+```json
+{ "preview": true,
+  "notASignal": "…Never render this as a signal.",
+  "syntheticHolding": { "used": true, "entryPrice": 7227.6, "caveat": "…gainPct here is fabricated…" },
+  "kind": "sell", "symbol": "POLYCAB",
+  "signal": { "direction": "sell", "pricing": { … }, "criteria": [ … ], … } }
+```
+
+- Nothing is alerted, nothing enters the track record, `/cycle-signals` is untouched.
+- If the symbol is not held, a stand-in holding is used at 20% below current price.
+  It is declared rather than hidden: **`holding.gainPct` is fabricated in that case**
+  and every other number is real.
+- `preview: true` and `notASignal` travel with the payload. Do not render it in the
+  signal list, and if you show it while developing, show it labelled.
+
+---
+
 ### `GET /holdings` — every row gains
 `cycle` (derived) and `holdingPeriod`:
 ```json

@@ -46,6 +46,7 @@ import { derive as deriveIntraday } from "./lib/intraday.js";
 import { suggest as suggestSize, concentration as computeConcentration, DEFAULT_SIZING } from "./lib/sizing.js";
 import * as gate from "./lib/alertgate.js";
 import * as analysts from "./lib/analysts.js";
+import * as pravesh from "./lib/praveshTrigger.js";
 import { build as buildPlaybook } from "./lib/playbook.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1086,6 +1087,20 @@ app.post("/analysts/scrape", async (req, res) => {
   res.json({ ...out, ...analysts.forSymbol(sym) });
 });
 
+app.get("/pravesh/trigger-status", (_, res) =>
+  res.json(pravesh.status(gate.loadHolidays()?.dates || [])));
+
+/* Manual dispatch, for testing and for re-running after a failure. Same CORS
+   rule as every other write endpoint. */
+app.post("/pravesh/trigger", async (req, res) => {
+  const c = pravesh.config();
+  const missing = pravesh.missingConfig(c);
+  if (missing.length) return res.status(400).json({ error: `not configured — missing ${missing.join(", ")}` });
+  const slot = String(req.body?.slot || "manual");
+  const out = await pravesh.dispatch(slot, c);
+  res.status(out.ok ? 200 : 502).json(out);
+});
+
 app.get("/alerts/status", (_, res) => res.json({
   ...gate.status(config.alertLimits),
   override: process.env.ALERT_HOURS_OVERRIDE === "true",
@@ -1387,4 +1402,6 @@ app.listen(PORT, async () => {
 
   // Only on hosts that sleep on idle — unset SELF_URL leaves everything as-is.
   if (process.env.SELF_URL) startKeepAlive(process.env.SELF_URL);
+  // Same IST logic as the keep-alive; inert unless explicitly enabled.
+  pravesh.startPraveshTrigger(() => gate.loadHolidays()?.dates || []);
 });

@@ -40,3 +40,19 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+
+      # Pravesh workflow trigger. GitHub's own scheduler never fired a single
+      # run, so the backend dispatches instead. Inert unless ENABLED is "true".
+      # GITHUB_TOKEN must be a FINE-GRAINED PAT scoped to the pravesh-engine repo
+      # only, with Actions: read and write. Nothing else. A classic broad token
+      # here would hand this service write access to every repo you own.
+      - key: PRAVESH_TRIGGER_ENABLED
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: PRAVESH_REPO
+        sync: false
+      - key: PRAVESH_WORKFLOW
+        sync: false
+      - key: PRAVESH_TRIGGER_SLOTS
+        sync: false

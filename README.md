@@ -495,6 +495,55 @@ works without it.
 Railway/Fly.io work the same way. Free tiers sleep on idle (~30s cold start) —
 fine for validation; upgrade to a cheap always-on dyno when you productize.
 
+## Pravesh runs, triggered from here rather than by GitHub
+GitHub's scheduled workflows are best-effort on shared infrastructure. The cron in
+`pravesh-daily.yml` was present and correct on master and **never fired once** —
+every run in the history was manual. So the backend dispatches instead, twice a
+weekday, using the same timezone-correct IST logic as the keep-alive:
+
+| slot | window (IST) |
+|------|--------------|
+| morning | 09:00–10:30 |
+| afternoon | 15:00–16:00 |
+
+Two runs because subscription multiples and GMP move a lot between morning and
+mid-afternoon, and the afternoon report is meant to read as an update.
+
+**A slot is a window, not an instant, and that is deliberate.** A free-tier
+instance sleeps overnight, so at 09:00 there may be no process alive to fire
+anything. Whatever first wakes it — an uptime pinger, the keep-alive, you opening
+the dashboard — causes the dispatch, even at 09:07. **An external uptime pinger
+hitting `/health` from about 08:45 IST is what makes this punctual**; without one,
+the run happens whenever the instance next wakes inside the window. Dispatch state
+is per slot per IST day and persisted, so a restart cannot double-fire and the
+morning run cannot satisfy the afternoon one.
+
+| env var | meaning |
+|---------|---------|
+| `PRAVESH_TRIGGER_ENABLED` | `false` by default — the feature is inert until set to `true` |
+| `GITHUB_TOKEN` | **fine-grained PAT, scoped to the `pravesh-engine` repo only, `Actions: read and write`** |
+| `PRAVESH_REPO` | e.g. `hardik-goel/pravesh-engine` |
+| `PRAVESH_WORKFLOW` | e.g. `pravesh-daily.yml` |
+| `PRAVESH_TRIGGER_SLOTS` | `morning:09:00-10:30,afternoon:15:00-16:00` — changing slots is config, not code |
+
+> **The token scope matters.** Use a fine-grained PAT limited to that one repo with
+> Actions read/write and nothing else. A classic broad token here would hand this
+> service write access to every repository you own, in exchange for the ability to
+> press one button.
+
+`GET /pravesh/trigger-status` shows, per slot: the window, whether it is open now,
+whether it has been dispatched today and at what IST time, plus the last error —
+so the logs answer why a run did or did not happen. `POST /pravesh/trigger
+{ slot }` dispatches on demand. The token appears in neither.
+
+A failed dispatch is **not** recorded, so the next five-minute check retries while
+the window is still open. Nothing here can throw into the scan loop.
+
+> **Remove the `schedule:` block from `pravesh-daily.yml` once this is verified.**
+> With both active the workflow can run twice in a morning, and the engine's dedupe
+> is not built for that. The backend trigger is the primary; the cron has never
+> worked and should go.
+
 ## Keep-alive (env `SELF_URL`)
 A sleeping instance means a missed alert. Set `SELF_URL` to this service's own
 deployed URL (e.g. `https://trinetra-backend-tukc.onrender.com`) and the backend

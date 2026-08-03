@@ -1050,6 +1050,12 @@ app.post("/settings/sizing", (req, res) => {
 const BACKUP_FILES = [
   "signal_history.json", "paper_trades.json", "ipo_applications.json",
   "holdings.json", "events.json",
+  /* The alert ledger belongs here or a restore does not actually restore: with
+     it gone, every currently-locked stock reads as a fresh edge and re-fires the
+     storm the gate exists to prevent. Analyst calls belong here because manual
+     entry is the ONLY working broker path — scraping is blocked — so those rows
+     are hand-typed research that cannot be regenerated. */
+  "alert_ledger.json", "analyst_calls.json", "market_holidays.json",
 ];
 const DATA_DIR = path.join(__dirname, "data");
 
@@ -1143,6 +1149,7 @@ app.post("/restore", (req, res) => {
 
   // Re-read, or the process would keep serving what it was holding in memory.
   history.reload(); paper.reload(); ipo.reload(); holdings.reload();
+  analysts.reload(); gate.loadLedger(); gate.loadHolidays();
 
   if (body.universe?.groups && typeof body.universe.groups === "object") {
     GROUPS = migrateGroups({ groups: body.universe.groups }, cleanSymbols);

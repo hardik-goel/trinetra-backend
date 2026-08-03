@@ -396,8 +396,15 @@ so a wrong one cannot be discovered a character at a time by measuring the
 response.
 
 `GET /backup` returns one file containing signal history, paper trades, IPO
-applications, holdings, the events cache, your watchlist groups, and the tuned
-config — profiles, thresholds, sizing and exit rules.
+applications, holdings, the events cache, **the alert ledger**, **broker calls**,
+your watchlist groups, and the tuned config — profiles, thresholds, sizing and
+exit rules.
+
+Two of those matter more than they look. Without the **alert ledger** a restore
+does not actually restore: every currently-locked stock reads as a fresh edge and
+re-fires the storm the market-hours gate exists to prevent. Without **broker
+calls** you lose hand-entered research that cannot be regenerated, since
+scraping brokerage pages does not work.
 
 **Telegram credentials are deliberately excluded.** The backup travels over HTTP
 and lands in a file that will sit around on a laptop; a bot token belongs in

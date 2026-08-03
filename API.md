@@ -378,3 +378,8 @@ reloads every module from disk so the process stops serving stale records.
 
 If the dashboard surfaces this, it is a settings-panel action, not a routine
 one: "Download backup" before a deploy, "Restore from file" after.
+
+**Auth:** `/backup` and `/restore` require `X-Backup-Token` (or
+`Authorization: Bearer …`) matching the service's `BACKUP_TOKEN`. With that env
+var unset both return **503** rather than serving — they expose and can destroy
+the whole trading record, and CORS does not protect a non-browser caller.

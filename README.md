@@ -247,15 +247,27 @@ everywhere — a 100% win rate over two signals is not a track record.
 > use backup/restore below before every deploy.
 
 ## Backup and restore (the free-tier substitute for a disk)
+Set `BACKUP_TOKEN` to any long random string first. Without it both endpoints
+return 503 — they read out and can overwrite the entire trading record on a
+public URL, so there is deliberately no configuration in which they are open.
+`UI_ORIGIN` is no help here: CORS is a browser rule and `curl` ignores it.
+
 ```bash
+export TOKEN=...   # the BACKUP_TOKEN you set on the service
+
 # before deploying
-curl -s https://your-backend.onrender.com/backup > trinetra-backup.json
+curl -s -H "X-Backup-Token: $TOKEN" \
+     https://your-backend.onrender.com/backup > trinetra-backup.json
 
 # after the deploy comes up
 curl -s -X POST https://your-backend.onrender.com/restore \
-     -H 'Content-Type: application/json' \
+     -H "X-Backup-Token: $TOKEN" -H 'Content-Type: application/json' \
      --data-binary @<(jq '. + {confirm:true}' trinetra-backup.json)
 ```
+
+`Authorization: Bearer <token>` works too. Tokens are compared in constant time,
+so a wrong one cannot be discovered a character at a time by measuring the
+response.
 
 `GET /backup` returns one file containing signal history, paper trades, IPO
 applications, holdings, the events cache, your watchlist groups, and the tuned

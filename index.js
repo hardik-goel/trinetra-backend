@@ -17,6 +17,7 @@ import express from "express";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
+import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { yahooDelayed } from "./providers/yahooDelayed.js";
 import { stooqEod } from "./providers/stooqEod.js";
@@ -867,12 +868,45 @@ const BACKUP_FILES = [
 ];
 const DATA_DIR = path.join(__dirname, "data");
 
+/* These two endpoints read out the entire trading record and can overwrite it,
+   on a public URL. CORS is no defence — it is a browser rule, and curl ignores
+   it. So they are gated on a shared secret and FAIL CLOSED: with BACKUP_TOKEN
+   unset they refuse to serve at all, because there must be no configuration in
+   which they are silently public. */
+const BACKUP_TOKEN = (process.env.BACKUP_TOKEN || "").trim();
+
+// Constant-time compare: a plain === leaks the token a character at a time to
+// anyone willing to measure the response.
+function tokenMatches(given) {
+  const a = Buffer.from(String(given || ""));
+  const b = Buffer.from(BACKUP_TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function guardBackup(req, res) {
+  if (!BACKUP_TOKEN) {
+    res.status(503).json({
+      error: "backup and restore are disabled",
+      reason: "BACKUP_TOKEN is not set on this service. These endpoints expose and overwrite the whole trading record, so they refuse to run without one.",
+    });
+    return false;
+  }
+  const given = req.get("X-Backup-Token") || (req.get("Authorization") || "").replace(/^Bearer\s+/i, "");
+  if (!tokenMatches(given)) {
+    console.warn(`[backup] rejected ${req.method} ${req.path} — bad or missing token`);
+    res.status(401).json({ error: "invalid or missing X-Backup-Token" });
+    return false;
+  }
+  return true;
+}
+
 const readDataFile = f => {
   try { return JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), "utf8")); }
   catch { return null; }
 };
 
-app.get("/backup", (_, res) => {
+app.get("/backup", (req, res) => {
+  if (!guardBackup(req, res)) return;
   const files = {};
   for (const f of BACKUP_FILES) {
     const data = readDataFile(f);
@@ -894,6 +928,7 @@ app.get("/backup", (_, res) => {
 });
 
 app.post("/restore", (req, res) => {
+  if (!guardBackup(req, res)) return;
   const body = req.body || {};
   if (body.backupVersion !== 1) return res.status(400).json({ error: "unrecognised or missing backupVersion" });
   // Restoring overwrites records that cannot be reconstructed, so it takes an

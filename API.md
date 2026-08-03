@@ -581,6 +581,15 @@ Cycle signals carry a flattened `pricing` block ready to render:
 rather than inventing them. Sorting a table on potential must use the magnitude, so
 buys and sells rank by size rather than sells sorting to the bottom as negatives.
 
+`GET /signals/stats` may also return `excluded`:
+
+```json
+"excluded": { "n": 4, "reason": "screener signals filed under a holdings-only profile, …" }
+```
+
+Render it as a line under the table when non-null. The totals legitimately shrank,
+and a smaller number with no explanation reads as a backend that lost data.
+
 **Track Record reports the two separately.** `GET /signals/stats` returns
 `byDirection: { buy: {…}, sell: {…} }`, each with its own `n` and win rate. A sell is
 correct when price *fell*, so its return is stored sign-inverted at the point of

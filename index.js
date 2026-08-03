@@ -44,6 +44,8 @@ import { potential, confidence, exitLevels, atrPct } from "./lib/analysis.js";
 import { derive as deriveIntraday } from "./lib/intraday.js";
 import { suggest as suggestSize, concentration as computeConcentration, DEFAULT_SIZING } from "./lib/sizing.js";
 import * as gate from "./lib/alertgate.js";
+import * as analysts from "./lib/analysts.js";
+import { build as buildPlaybook } from "./lib/playbook.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = f => JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8"));
@@ -320,6 +322,9 @@ async function refresh() {
     const priceBySymbol = Object.fromEntries(snapshot.data.map(q => [q.symbol, q.price]));
     history.markOutcomes(priceBySymbol);
     paper.markToMarket(priceBySymbol);
+    // Broker calls are scored against what price actually did, not what was
+    // claimed — resolution needs the price series, which only exists here.
+    for (const q of snapshot.data) analysts.resolveCalls(q.symbol, q.candles);
     ensureForecasts(SYMBOLS, applyForecasts);
   } catch (e) {
     console.error("[trinetra] refresh failed:", e.message);
@@ -936,6 +941,86 @@ app.get("/decision", (req, res) => {
       ? `Prices are ~${Math.round((PROVIDER_LAG_S[PROVIDER] ?? 900) / 60)} minutes delayed. This stock has already moved ${pot?.movedAlreadyPct >= 0 ? "+" : ""}${pot?.movedAlreadyPct ?? 0}% since the trigger level; the estimate below is what may remain, not the full move.`
       : null,
   });
+});
+
+/* ── playbook ─────────────────────────────────────────────────────────────
+   The heavy parts — levels, pattern backtests, broker records — are stable
+   within a day, so they are cached per symbol per profile per trading day. The
+   cheap parts move with price and are recomputed on every request. */
+const playbookCache = new Map();
+
+function playbookFor(symbol, profileId) {
+  const stock = stockBySymbol()[symbol];
+  if (!stock) return null;
+  const profile = config.profiles[profileId] || config.profiles.swing;
+  if (!profile) return null;
+  const key = `${symbol}:${profile.horizon}:${gate.tradingDay()}:${Math.round(stock.price)}`;
+  if (playbookCache.has(key)) return playbookCache.get(key);
+  if (playbookCache.size > 400) playbookCache.clear();
+  const pb = buildPlaybook(stock, {
+    profile, dataAge: dataAge(), event: stock.nextEvent,
+    triggerPrice: triggerFor(stock, profile),
+  });
+  playbookCache.set(key, pb);
+  return pb;
+}
+
+app.get("/playbook", (req, res) => {
+  const sym = String(req.query.symbol ?? "").trim().toUpperCase();
+  const pb = playbookFor(sym, cleanId(req.query.profile || "swing"));
+  if (!pb) return res.status(404).json({ error: "symbol not in the current snapshot, or no such profile" });
+  res.json({ ...pb, asOf: snapshot.at, dataAge: dataAge() });
+});
+
+app.get("/playbook/all", (req, res) => {
+  const profileId = cleanId(req.query.profile || "swing");
+  const rows = [];
+  for (const s of snapshot.data) {
+    const pb = playbookFor(s.symbol, profileId);
+    if (!pb) continue;
+    if (pb.insufficient) {
+      rows.push({ symbol: s.symbol, price: s.price, insufficient: true, reading: pb.reading });
+      continue;
+    }
+    rows.push({
+      symbol: pb.symbol, price: pb.price,
+      entry: { kind: pb.entry.kind, zone: pb.entry.zone, triggered: pb.entry.triggered,
+               chasing: pb.entry.chasing, convergence: pb.entry.convergence,
+               confidence: { score: pb.entry.confidence.score, band: pb.entry.confidence.band } },
+      primary: pb.exits.primary ? { zone: pb.exits.primary.zone, pct: pb.exits.primary.pct, convergence: pb.exits.primary.convergence } : null,
+      stop: { zone: pb.exits.stop.zone, pct: pb.exits.stop.pct },
+      riskReward: pb.exits.riskReward,
+      potential: pb.potential,
+      exitConfidence: { score: pb.exits.confidence.score, band: pb.exits.confidence.band },
+      convergence: pb.convergence,
+      reading: pb.reading,
+    });
+  }
+  res.json({ profile: profileId, asOf: snapshot.at, dataAge: dataAge(), rows });
+});
+
+app.get("/analysts", (req, res) => {
+  const sym = String(req.query.symbol ?? "").trim().toUpperCase();
+  if (!sym) return res.status(400).json({ error: "symbol required" });
+  res.json(analysts.forSymbol(sym));
+});
+
+/* Manual entry exists because scraping brokerage pages is unreliable by nature.
+   A call typed in by hand is scored identically — it is arguably better data,
+   since nothing was inferred from a page layout that may have changed. */
+app.post("/analysts", (req, res) => {
+  const rec = analysts.addCall(req.body || {}, "manual");
+  if (!rec) return res.status(400).json({ error: "symbol and broker are required" });
+  playbookCache.clear(); // a new target can move a level
+  res.json(rec);
+});
+
+app.post("/analysts/scrape", async (req, res) => {
+  const sym = String(req.body?.symbol ?? "").trim().toUpperCase();
+  if (!sym) return res.status(400).json({ error: "symbol required" });
+  const out = await analysts.scrape(sym);
+  playbookCache.clear();
+  res.json({ ...out, ...analysts.forSymbol(sym) });
 });
 
 app.get("/alerts/status", (_, res) => res.json({

@@ -1087,6 +1087,13 @@ app.patch("/ipo-applications/:id", (req, res) => {
 app.delete("/ipo-applications/:id", (req, res) =>
   ipo.remove(req.params.id) ? res.json({ ok: true }) : res.status(404).json({ error: "no such application" }));
 
+/* Expert views on the IPOs Pravesh covers. Separate from /analysts, which is
+   keyed on symbol — an unlisted IPO has no ticker and joins on ipoSlug. */
+app.get("/ipo/expert-calls", async (_, res) => {
+  try { res.json(await ipo.expertCalls()); }
+  catch (e) { res.status(502).json({ ok: false, reason: e.message, calls: [] }); }
+});
+
 app.get("/ipo-applications/stats", async (req, res) =>
   res.json(await ipo.stats(Math.max(1, +req.query.days || 365))));
 

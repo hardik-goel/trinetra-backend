@@ -547,6 +547,56 @@ and a hand-entered call is scored identically to a scraped one.
 
 ---
 
+### `GET /ipo/expert-calls` — expert views on IPOs
+
+Ingested from Pravesh's `expert_feed` (`data/latest.json`, schema 2+). **Separate
+from `/analysts`**, which is keyed on symbol: an unlisted IPO has no ticker, so
+`symbol` is always `null` and the join key is `ipoSlug`.
+
+```json
+{ "ok": true, "schemaVersion": 2, "supported": true, "blocked": false,
+  "verdict": "checked, no attributable view — the routes that answered carried no explicit stance from these experts",
+  "calls": [ { "ipoSlug": "acme-industries", "ipoName": "Acme Industries",
+               "symbol": null, "expert": "Sandeep Jain",
+               "call": "Subscribe for listing gains", "stanceNormalised": "POSITIVE",
+               "url": "…", "seenAt": "2026-08-02T09:00:00Z",
+               "capturedAt": "2026-08-03T04:00:00Z", "source": "google_news_rss",
+               "target": null, "stop": null } ],
+  "coverage": { "issues": 13, "covered": 0 },
+  "sourceStatus": [ { "source": "gnews", "routes": [
+      { "route": "google_news_rss", "attempted": 4, "answered": 1,
+        "hits": 0, "dropped": 0, "reason": "responded 1/4, no matching item" } ] } ],
+  "limits": [ "Google News RSS returns headline and summary only …", … ] }
+```
+
+**The field that matters is `blocked`, and `verdict` states it in words — render it.**
+Zero calls has two causes that mean opposite things:
+
+- `blocked: true` — every route 403'd or timed out. The absence of expert views says
+  **nothing**. Do not render "no expert view"; render "could not check".
+- `blocked: false` with no calls — the routes answered and carried no explicit stance.
+  That is a real coverage absence and can be shown as such.
+
+Collapsing those two into an empty state would launder a broken scraper into an
+opinion, which is the failure this endpoint is shaped to prevent.
+
+Other honest limits, all in `limits[]` and worth surfacing near the calls:
+
+- `call` is **verbatim** and never normalised — `stanceNormalised` is the separate,
+  derived field. Show the verbatim words; "Subscribe for listing gains" and
+  "Subscribe for the long term" are different instructions.
+- `target` and `stop` are **always null**. An expert's IPO call is subscribe or
+  avoid, not a level. Do not render an empty target column as though data is missing.
+- `seenAt` is publication time and may be `null`; `capturedAt` is when it was
+  scraped. They are not interchangeable — staleness is measured from `seenAt`.
+- A row without a `url` is dropped before it reaches you. An unattributed call is
+  not evidence.
+
+`supported: false` with `schemaVersion: 1` means Pravesh is publishing the old
+schema — feature-detect on `schemaVersion >= 2`, never `=== 2`.
+
+---
+
 ### Direction-aware pricing
 
 `direction: "buy" | "sell"` is on every playbook, signal, cycle signal and history

@@ -669,9 +669,41 @@ function scanCycles() {
     const period = cycle.holdingPeriod(h);
     const derived = cycle.derive(h, stock.price);
 
+    /* Prices for a trim are the mirror of prices for an entry: the action level is
+       where you sell, the target sits BELOW it, and the move is a fall. Built by
+       the same playbook rather than by inverting numbers here, so one renderer and
+       one set of labels serve both. */
+    const pricingFor = (kind) => {
+      const dir = kind === "sell" ? "sell" : "buy";
+      try {
+        const pb = buildPlaybook(withCtx, {
+          profile: kind === "sell" ? sellP : buyP, dataAge: dataAge(), direction: dir,
+        });
+        const t = pb.exits?.primary;
+        if (!pb.entry?.zone || !t) return null;
+        return {
+          direction: dir,
+          actionLabel: pb.exits.actionLabel, targetLabel: pb.exits.targetLabel,
+          actionZone: pb.entry.zone,
+          actionPrice: Math.round(((pb.entry.zone.low + pb.entry.zone.high) / 2) * 100) / 100,
+          targetPrice: t.mid, targetZone: t.zone,
+          // Magnitude plus a direction flag — never a negative "gain".
+          movePct: t.movePct, downward: !!t.downward, arrow: t.downward ? "▼" : "▲",
+          stop: pb.exits.stop ? { price: pb.exits.stop.mid, above: !!pb.exits.stop.above, rationale: pb.exits.stop.rationale } : null,
+          riskReward: pb.exits.riskReward?.toPrimary ?? null,
+          confidence: pb.exits.confidence ? { score: pb.exits.confidence.score, band: pb.exits.confidence.band } : null,
+          anchor: t.anchor,
+        };
+      } catch (e) { return null; }
+    };
+
     const render = (ev, kind) => ({
       id: `cyc_${kind}_${h.id}`,
       holdingId: h.id, symbol: h.symbol, kind,
+      // A trim is a sell; buying back is a buy. Stated, never inferred from `kind`
+      // by whoever is rendering.
+      direction: kind === "sell" ? "sell" : "buy",
+      pricing: pricingFor(kind),
       subtitle: kind === "sell" ? "sell a portion of your holding" : "buy back what you sold",
       // Failed checks travel too: three of four is not four of four, and the
       // fourth is worth seeing.
@@ -743,8 +775,8 @@ function cycleDetail(chk, stock, ctx, h) {
   if (chk.v == null) return null;
   const v = chk.v;
   switch (chk.metric) {
-    case "extensionVs20dma": return `${v.toFixed(1)}% above the 20-day average`;
-    case "extensionVs50dma": return `${v.toFixed(1)}% above the 50-day average`;
+    case "extensionVs20dma": return `${Math.abs(v).toFixed(1)}% ${v < 0 ? "below" : "above"} the 20-day average`;
+    case "extensionVs50dma": return `${Math.abs(v).toFixed(1)}% ${v < 0 ? "below" : "above"} the 50-day average`;
     case "rsi14": return `RSI ${v.toFixed(0)}`;
     case "rsiRecovery": return `RSI turning up at ${v.toFixed(0)}`;
     case "atResistancePct": return ctx.resistanceLevel
@@ -1046,7 +1078,23 @@ app.post("/criteria/restore-defaults", (req, res) => {
   if (!p) return res.status(404).json({ error: "no such profile" });
   p.criteria = structuredClone(CANONICAL_CRITERIA);
   saveConfig(); scan();
-  res.json({ ok: true, profile: id, criteria: p.criteria, matchesCanonical: true });
+  res.json({ ok: true, profile: id, criteria: p.criteria, matchesCanonical: true,
+             originalFour: originalFourStatus(p.criteria, PROVIDER) });
+});
+
+/* "Restore the original four" — the same action, named the way the user names it.
+   It restores all four including the dormant order-book criterion, so the fourth
+   is visibly present-and-waiting rather than quietly absent. */
+app.post("/criteria/restore-original-four", (req, res) => {
+  const id = cleanId(req.body?.profile || "swing");
+  const p = config.profiles[id];
+  if (!p) return res.status(404).json({ error: "no such profile" });
+  p.criteria = structuredClone(CANONICAL_CRITERIA);
+  saveConfig(); scan();
+  res.json({
+    ok: true, profile: id, criteria: p.criteria, matchesCanonical: true,
+    originalFour: originalFourStatus(p.criteria, PROVIDER),
+  });
 });
 
 app.post("/profiles", (req, res) => {

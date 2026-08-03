@@ -26,6 +26,13 @@ If you are wiring the dashboard, these are the surfaces that are new or reshaped
 5. **`/brief`** assembles the whole morning view server-side, so the dashboard
    can render it without composing it.
 6. `/snapshot` no longer ships candle arrays (server-side analysis only).
+7. **`originalFour` on `GET /profiles`**, plus `POST /criteria/restore-original-four`
+   — the four criteria the app was commissioned against, in the user's own words,
+   with each one's live state. Render from this, never from a hardcoded list.
+8. **Named experts** in the analyst ledger (`kind: "expert"`), and a hard 10-point
+   cap on their combined confidence contribution.
+9. **`direction` is on every playbook, signal, cycle signal and history record**,
+   and the price labels travel with the payload. Do not infer them.
 
 ---
 
@@ -472,10 +479,121 @@ doc and the summary message differed — the doc wins:**
 `kind` is **`"sell"` | `"buyBack"`** (not `sell_holding`/`buy_back`), and the field
 is **`reentryRisk`** (one capital, not `reEntryRisk`).
 
+### `GET /profiles` — `originalFour`
+
+The founding four criteria, read out of the engine so the panel can never drift
+from what actually runs:
+
+```json
+"originalFour": [
+  { "id": "fund", "originalIndex": 1, "originalPhrase": "Fundamentally strong",
+    "name": "Fundamentals", "status": "active", "present": true,
+    "countsTowardLock": true,
+    "checks": [ { "metric": "roe", "op": "gte", "value": 15 }, … ] },
+  { "id": "flow", "originalIndex": 4,
+    "originalPhrase": "Buyers and sellers count and percentage",
+    "name": "Order flow", "status": "awaiting live data (Kite)",
+    "present": true, "dormant": true, "countsTowardLock": false,
+    "dormantReason": "order-book depth is paid exchange data — unavailable on the free delayed feed",
+    "requiresProvider": "kite" }
+]
+```
+
+`status` is one of `"active"`, `"awaiting live data (Kite)"`, `"disabled by you"`,
+`"removed"`. **Render `originalPhrase` as the label** — those are the user's words
+for what he asked for, and the engine's `name` is a shorter internal one.
+
+The fourth is **present and disabled**, not missing. Show it greyed with its
+`dormantReason`, not hidden — the point is that it is visibly waiting rather than
+forgotten. `countsTowardLock: false` means it is out of the lock denominator, which
+is why the header reads 3/3 rather than 3/4 with an unreachable fourth. A disabled
+criterion does not affect `matchesCanonical`, so the drift banner stays quiet.
+
+```
+POST /criteria/restore-original-four  { profile? }   → { ok, criteria, originalFour, matchesCanonical }
+```
+Same effect as `restore-defaults`, named the way the user names it. Both now return
+`originalFour` so the panel can re-render from one response.
+
+---
+
+### Named experts — `POST /analysts/experts`, `GET /analysts?symbol=`
+
+Calls from named experts (**Sandeep Jain**, **Anil Singhvi**) sit in the same ledger
+as brokerage targets, distinguished by `kind`:
+
+```json
+{ "broker": "Sandeep Jain", "kind": "expert", "call": "Book profit",
+  "target": 9500, "stance": "bearish", "rationale": "…", "url": "…",
+  "seenAt": "2026-08-03T…", "staleAfterDays": 45,
+  "accuracy": { "n": 3, "insufficient": true } }
+```
+
+Three things to render honestly:
+
+- **`staleAfterDays` is 45 for experts, 90 for brokerages.** A read on the current
+  tape ages faster than a twelve-month price target. Past it, show it struck through
+  or in a "stale" group — do not silently drop it.
+- **`accuracy.insufficient: true` means show the count, not a hit rate.** Below five
+  resolved calls a percentage is noise dressed as a measurement.
+- **Expert influence is capped at 10 confidence points combined.** When it bites, the
+  reason is in `confidence.caps` — render it. Convergence of independent technical
+  methods can reach 28; a named human cannot outweigh that no matter how right they
+  have been, because the system must not become a channel for one person's opinion.
+
+Live scraping is best-effort and currently returns nothing (anti-bot). `POST
+/analysts { symbol, broker, call, target, rationale?, url? }` is the working path,
+and a hand-entered call is scored identically to a scraped one.
+
+---
+
+### Direction-aware pricing
+
+`direction: "buy" | "sell"` is on every playbook, signal, cycle signal and history
+record. **The labels ship with the payload — never infer them from a flag.**
+
+| field | buy | sell |
+|---|---|---|
+| `exits.actionLabel` | `"Entry"` | `"Sell at"` |
+| `exits.targetLabel` | `"Target"` | `"Buy back"` |
+| target vs price | above | **below** |
+| `stop.above` | `false` | `true` |
+
+Every level carries both `pct` (signed) and `movePct` (**magnitude**) plus
+`downward`. **Render `movePct` with the arrow, never `pct`.** A trim that captures a
+5.5% fall is a 5.5% ▼ win; printing `-5.5%` reads as a loss, and "5.5% upside" on a
+sell is simply wrong.
+
+Cycle signals carry a flattened `pricing` block ready to render:
+
+```json
+"direction": "sell",
+"pricing": { "direction": "sell",
+  "actionLabel": "Sell at",  "actionPrice": 9632.5, "actionZone": { "low": …, "high": … },
+  "targetLabel": "Buy back", "targetPrice": 9150,   "targetZone": { … },
+  "movePct": 5.55, "downward": true, "arrow": "▼",
+  "stop": { "price": 10126, "above": true, "rationale": "Above ₹10126, … the trim was early …" },
+  "riskReward": 1.23, "confidence": { "score": 65, "band": "moderate" },
+  "anchor": "round number + 20-day MA + candlestick" }
+```
+
+`pricing` is `null` when no zone could be built — render the signal without prices
+rather than inventing them. Sorting a table on potential must use the magnitude, so
+buys and sells rank by size rather than sells sorting to the bottom as negatives.
+
+**Track Record reports the two separately.** `GET /signals/stats` returns
+`byDirection: { buy: {…}, sell: {…} }`, each with its own `n` and win rate. A sell is
+correct when price *fell*, so its return is stored sign-inverted at the point of
+recording. Do not merge them into one figure — an average across two different kinds
+of bet is not a number about anything.
+
+---
+
 ### `GET /cycle-signals`
 ```json
 { "sell": [ { "id": "cyc_sell_hld_…", "holdingId": "hld_…", "symbol": "POLYCAB",
-    "kind": "sell", "subtitle": "sell a portion of your holding",
+    "kind": "sell", "direction": "sell", "pricing": { … see Direction-aware pricing … },
+    "subtitle": "sell a portion of your holding",
     "criteria": [ { "name": "At resistance", "pass": true, "skipped": false,
                     "detail": "₹9,890 — 52w-high, 0.4% away" } ],
     "holding": { "entryPrice": 7240, "currentPrice": 9890, "gainPct": 36.6,

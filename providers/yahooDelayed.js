@@ -38,7 +38,7 @@ async function fetchIntraday(symbol) {
 }
 
 async function fetchOne(symbol, wantIntraday) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=1y`;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=2y`;
   const r = await fetch(url, UA);
   if (!r.ok) throw new Error(`${symbol}: HTTP ${r.status}`);
   const res = (await r.json())?.chart?.result?.[0];

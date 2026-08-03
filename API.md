@@ -426,6 +426,19 @@ proposal, all additive:
 - `analysts.unavailable: true` is the normal state today — scraping is blocked.
   Offer manual entry rather than an empty panel.
 
+**Percentages are measured from `basisPrice`, not from spot.** For an untriggered
+setup that is the entry zone — the price you would actually pay — because measuring
+from spot describes buying now, which the entry rule forbids. The payload states
+which it used:
+
+```json
+"basisPrice": 1907.8, "basis": "entry zone — the setup has not triggered yet",
+"potential": { "toPrimaryPct": 3.52, "fromSpotToPrimaryPct": 18.26, … }
+```
+
+`fromSpotToPrimaryPct` is there if you want to show the distance from the current
+price, but it is not the trade's potential and should never drive risk-reward.
+
 **Rendering rules that are not cosmetic:**
 - Levels are zones. Never render a single price where the payload gives a range.
 - `convergence: 0` is a finding — "no level here, methods disagree" — not an

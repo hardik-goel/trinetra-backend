@@ -509,10 +509,19 @@ Railway/Fly.io work the same way. Free tiers sleep on idle (~30s cold start) —
 fine for validation; upgrade to a cheap always-on dyno when you productize.
 
 ## Pravesh runs, triggered from here rather than by GitHub
-GitHub's scheduled workflows are best-effort on shared infrastructure. The cron in
-`pravesh-daily.yml` was present and correct on master and **never fired once** —
-every run in the history was manual. So the backend dispatches instead, twice a
-weekday, using the same timezone-correct IST logic as the keep-alive:
+GitHub's scheduled workflows are best-effort on shared infrastructure, and this
+one **drifts by hours**. The original diagnosis here — "the cron never fires" —
+was wrong, and the correction is worth recording because it changes what the
+problem actually is.
+
+Measured on 2026-08-03: nominal `30 3 * * 1-5` = 03:30 UTC / 09:00 IST, actual
+queue time **06:41 UTC / 12:11 IST — 3h12m late**. It delivered a real report.
+Three earlier checks at 09:00, 09:30 and 11:20 IST all predated that, so silence
+was observed and lateness was concluded. Same evidence, wrong inference.
+
+A trigger that lands three hours late is not coverage: the morning report is for
+the morning. So the backend dispatches instead, twice a weekday, using the same
+timezone-correct IST logic as the keep-alive:
 
 | slot | window (IST) |
 |------|--------------|
@@ -552,10 +561,17 @@ so the logs answer why a run did or did not happen. `POST /pravesh/trigger
 A failed dispatch is **not** recorded, so the next five-minute check retries while
 the window is still open. Nothing here can throw into the scan loop.
 
-> **Remove the `schedule:` block from `pravesh-daily.yml` once this is verified.**
-> With both active the workflow can run twice in a morning, and the engine's dedupe
-> is not built for that. The backend trigger is the primary; the cron has never
-> worked and should go.
+> **The `schedule:` block has been removed from `pravesh-daily.yml`.** With both
+> active the workflow can run twice in a morning: a schedule trigger passes no
+> input, so `inputs.slot || 'morning'` labels its run "morning" and it collides
+> with this trigger's morning dispatch. The only reason they missed each other on
+> 2026-08-03 was the cron's three-hour drift, and drift is not a control.
+>
+> **There is now no fallback behind this trigger.** If the instance is asleep
+> through a whole window, that slot passes silently — which is exactly why the
+> external pinger below matters. If a fallback is wanted, it belongs at 08:00 UTC
+> (13:30 IST), clear of both windows, not at the old 03:30 UTC where it would
+> land inside the morning slot whenever it happens to run on time.
 
 ## Keep-alive (env `SELF_URL`)
 A sleeping instance means a missed alert. Set `SELF_URL` to this service's own

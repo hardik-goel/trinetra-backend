@@ -235,6 +235,78 @@ shows up there rather than being quietly buried.
   events. **An empty brief is still sent** — silence must always mean breakage,
   never emptiness. `POST /brief/send` to fire one on demand.
 
+## The Playbook — entry, exit, and the evidence for both
+Four questions per stock: where to get in, where it is now, where to get out,
+what is left. `GET /playbook?symbol=&profile=` for one, `GET /playbook/all` for
+the table.
+
+**Convergence is the organising rule.** A level found by one method is that
+method's opinion. The same level found by a swing cluster, a Fibonacci
+retracement, a moving average and a broker target is a level, because those four
+do not share a premise. Candidates are clustered into ATR-sized zones and scored
+by how many independent **families** agree — structure, trend, fibonacci, volume,
+broker, candlestick. Families rather than candidates: three round numbers near a
+price are one opinion three times, and psychological levels get no vote at all,
+only reinforcement.
+
+When nothing converges the payload says so. "Four methods, no agreement" is the
+finding, not a gap to fill with a confident number.
+
+Levels are always **zones**, never single prices — a level quoted to the paisa on
+a stock that swings 2.4% a day is false precision.
+
+### Candlestick evidence, measured on this stock
+Patterns are reported only with the context that decides whether they matter: the
+prior move (a bullish reversal needs something to reverse), the nearest level
+within half an ATR, and volume against the 20-day average. Detections failing the
+context test are kept in `detected` for transparency but never reach `valid` or
+the evidence list.
+
+Reliability is backtested **per pattern per stock**, never taken from a textbook
+table — and always against that stock's own base rate:
+
+```
+three_white_soldiers   78.26%  vs baseline 78.78%  →  no better than a random day (n=69)
+hammer                  100%   vs baseline 78.78%  →  better than base rate (n=11)
+shooting_star          insufficient (n=3)
+```
+
+Without the baseline the first line reads "78% reliable". Almost every pattern
+clears "price rose 1% within five sessions" on a volatile stock, so the raw rate
+measures volatility, not the pattern. Under 8 occurrences there is no rate at all.
+
+### Broker calls and whether the broker was right
+`GET /analysts?symbol=` returns calls with targets, ages and each broker's
+**measured** hit rate. Every call is logged when seen and resolved later against
+what price actually did, inside a six-month window. Below five resolved calls a
+broker has a count and no rate.
+
+Calls older than 90 days stop moving levels but still appear, with their age — a
+target from last year is history, not a view.
+
+**Scraping brokerage pages does not currently work**, and was not expected to:
+Moneycontrol and Trendlyne both return a page whose markup no longer matches any
+selector, and these sites actively block automated access. `POST /analysts/scrape`
+exists and reports precisely what failed; `analysts.unavailable: true` is the
+normal state. The playbook stands without it on technical, candlestick and analog
+evidence.
+
+**So enter calls by hand**: `POST /analysts { symbol, broker, call, target,
+rationale?, url? }`. Broker names are normalised through an alias map, so
+"kotak securities" and "Kotak Institutional Equities" accumulate one record. A
+hand-entered call is scored identically — arguably better data, since nothing was
+inferred from a page layout that may have changed.
+
+### Evidence includes what argues against
+Every entry and exit carries an ordered `evidence[]`, each item with
+`stance: "supports" | "opposes" | "neutral"`, a plain-English `detail`, a weight,
+and `reliability: { rate, n } | null`. A broker target below the current price and
+a bearish pattern at resistance both appear as `opposes`. A one-sided list is
+marketing, not analysis.
+
+`reliability: null` means not measurable, which is different from zero — render
+"insufficient history", never "0%".
+
 ## Watchlists
 `universe.json` may be a flat list or `{ "groups": { "Default": [...] } }`. A flat
 file migrates into `Default` on first load, and the `/universe` routes keep

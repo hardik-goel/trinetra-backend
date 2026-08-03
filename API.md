@@ -398,3 +398,34 @@ Alerts deliver only Mon–Fri 09:15–15:30 IST and are edge-triggered. Signals 
 still **recorded** outside the window — suppression is about delivery, so Track
 Record stays complete. Worth surfacing `windowOpen` + `nextOpen` in the UI, or a
 quiet evening looks like a broken backend.
+
+---
+
+## Playbook
+
+`GET /playbook?symbol=&profile=` · `GET /playbook/all?profile=` ·
+`GET /analysts?symbol=` · `POST /analysts` · `POST /analysts/scrape`
+
+Shapes are as in `docs/PLAYBOOK_CONTRACT.md`, with these differences from that
+proposal, all additive:
+
+- `entry.families` / `exits.*.families` — which independent method families back
+  the zone (`structure`, `trend`, `fibonacci`, `volume`, `broker`, `candlestick`).
+  `convergence` is that list's length.
+- `exits.safe|primary|stretch` each carry `zone`, `mid`, `pct`, `anchor`,
+  `convergence`, `families`, `evidence` — there is no flat `ladder` array.
+- `candles.detected` includes context-INVALID patterns for transparency;
+  `candles.valid` is the list that may be shown as evidence. Do not render
+  `detected` as findings.
+- `analysts.unavailable: true` is the normal state today — scraping is blocked.
+  Offer manual entry rather than an empty panel.
+
+**Rendering rules that are not cosmetic:**
+- Levels are zones. Never render a single price where the payload gives a range.
+- `convergence: 0` is a finding — "no level here, methods disagree" — not an
+  empty state.
+- Render `stance: "opposes"` items with equal prominence to supporting ones.
+- `reliability: null` → "insufficient history", never "0%".
+- `entry.chasing: true` → surface `entry.warning` prominently; it is the single
+  most common way a good signal becomes a bad trade.
+- `riskRewardWarning` is set when R:R to the primary target is below 1:1.

@@ -435,3 +435,17 @@ proposal, all additive:
 - `entry.chasing: true` → surface `entry.warning` prominently; it is the single
   most common way a good signal becomes a bad trade.
 - `riskRewardWarning` is set when R:R to the primary target is below 1:1.
+
+### `lockQuality` is on snapshot rows as well as signals
+`profileResults[<id>]` now carries `lockQuality`, `lockedOn[]`, `notEvaluated[]`
+and `warnings[]` alongside `count`/`total`/`locked`.
+
+It was previously only on fired signals, which meant a stock that is
+locked-but-partial *right now* — or whose fundamentals cannot be evaluated —
+showed nothing until it fired, and a watchlist could only learn the state by
+polling `/signals` for stocks that happened to fire today. The live state belongs
+on the live payload.
+
+`lockQuality: "partial"` means at least one criterion was excluded because it had
+no data. It is a materially different event from `"full"` and must not render
+identically — the excluded criterion is named in `notEvaluated[]`.

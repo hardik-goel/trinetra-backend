@@ -441,7 +441,16 @@ function scan() {
     const newlyLocked = [];
     for (const [id, profile] of active) {
       const ev = evaluate(s, profile.criteria);
-      results[id] = { count: ev.count, total: ev.total, locked: ev.locked, criteria: ev.criteria };
+      /* lockQuality belongs here, not only on a fired signal. A stock that is
+         locked-but-partial right now — or whose fundamentals could not be
+         evaluated — is in that state whether or not a signal fired today, and a
+         watchlist that can only learn it from /signals cannot show the live
+         picture at all. */
+      results[id] = {
+        count: ev.count, total: ev.total, locked: ev.locked, criteria: ev.criteria,
+        lockQuality: ev.lockQuality, lockedOn: ev.lockedOn, notEvaluated: ev.notEvaluated,
+        warnings: ev.warnings,
+      };
 
       // Edge, not level: fire when it BECOMES locked. A level test stays true
       // all evening once the tape stops, which is what caused the repeats.

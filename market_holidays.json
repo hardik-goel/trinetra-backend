@@ -1,0 +1,11 @@
+{
+  "year": 2026,
+  "note": "NSE trading holidays. ONLY fixed-date national holidays are seeded here, because they are the only ones that can be stated without a calendar: Republic Day, Independence Day and Gandhi Jayanti fall on the same date every year. The rest of the NSE list — Holi, Id, Ram Navami, Mahavir Jayanti, Good Friday, Buddha Purnima, Muharram, Ganesh Chaturthi, Dussehra, Diwali (with its Muhurat session), Guru Nanak Jayanti, Christmas — moves every year and is NOT included. Guessing those dates would be worse than leaving them out: a wrong date silences a real trading day, or lets alerts fire on a closed one. Copy the remaining dates from the NSE holiday circular each January and add them below.",
+  "source": "https://www.nseindia.com/resources/exchange-communication-holidays",
+  "updateAnnually": true,
+  "dates": [
+    "2026-01-26",
+    "2026-08-15",
+    "2026-10-02"
+  ]
+}

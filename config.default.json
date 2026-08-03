@@ -102,5 +102,14 @@
       "token": "",
       "chatId": ""
     }
+  },
+  "alertLimits": {
+    "preOpenBufferMinutes": 0,
+    "postCloseGraceMinutes": 0,
+    "cooldownMinutes": 240,
+    "maxPerSymbolPerDay": 1,
+    "maxPerCycle": 5,
+    "maxPerHour": 15,
+    "staleAfterMinutes": 10
   }
 }

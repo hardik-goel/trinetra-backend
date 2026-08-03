@@ -43,6 +43,7 @@ import { migrate as migrateProfiles, enabledProfiles, needsIntraday, cleanId, HO
 import { potential, confidence, exitLevels, atrPct } from "./lib/analysis.js";
 import { derive as deriveIntraday } from "./lib/intraday.js";
 import { suggest as suggestSize, concentration as computeConcentration, DEFAULT_SIZING } from "./lib/sizing.js";
+import * as gate from "./lib/alertgate.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = f => JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8"));
@@ -198,6 +199,7 @@ config.profiles = migrateProfiles(config);
 config.sizing = { ...DEFAULT_SIZING, ...(config.sizing || {}) };
 config.exitRules = { ...EXIT_RULES, ...(config.exitRules || {}) };
 config.briefTime = config.briefTime || "08:45";
+config.alertLimits = { ...gate.DEFAULT_ALERT_LIMITS, ...(config.alertLimits || {}) };
 
 const PROVIDER_LAG_S = { yahooDelayed: 900, stooqEod: 86_400, kite: 5 };
 const FEED_DELAYED = PROVIDER !== "kite";
@@ -381,14 +383,35 @@ function analyse(stock, profile, ev) {
 
 function scan() {
   const active = enabledProfiles(config.profiles);
+  const limits = config.alertLimits;
+  const now = Date.now();
+
+  /* Delivery is gated; recording is not. Every signal still reaches the track
+     record — suppressing an alert is a statement about when the user can act,
+     not about what happened. */
+  const override = process.env.ALERT_HOURS_OVERRIDE === "true";
+  const win = gate.marketWindow(now, limits);
+  const windowOpen = win.open || override;
+  const snapshotAgeMin = snapshot.at ? (now - snapshot.at) / 60_000 : Infinity;
+  const stale = snapshotAgeMin > (limits.staleAfterMinutes ?? 10);
+  const tally = { candidates: 0, sent: 0, suppressed: {} };
+  const suppress = reason => { tally.suppressed[reason] = (tally.suppressed[reason] || 0) + 1; };
+  // Collected per symbol, so one stock locking three profiles is one alert.
+  const pending = [];
+
   for (const s of snapshot.data) {
     const results = {};
+    const newlyLocked = [];
     for (const [id, profile] of active) {
       const ev = evaluate(s, profile.criteria);
       results[id] = { count: ev.count, total: ev.total, locked: ev.locked, criteria: ev.criteria };
 
+      // Edge, not level: fire when it BECOMES locked. A level test stays true
+      // all evening once the tape stops, which is what caused the repeats.
+      const becameLocked = gate.isNewLock(s.symbol, id, ev.locked);
       const key = `${id}:${s.symbol}`;
       if (!ev.locked || firedToday.has(key)) continue;
+      if (!becameLocked) continue;
       firedToday.add(key);
 
       const { potential: pot, confidence: conf, exits } = analyse(s, profile, ev);
@@ -424,9 +447,16 @@ function scan() {
       });
       entry.id = rec.id;
 
-      if (config.alerts?.telegram?.on && profile.alerts?.telegram !== false) {
-        notify(config.alerts.telegram, entry).catch(e => console.error("[alert]", e.message));
-      }
+      // A profile can be scanned but kept silent — useful while validating
+      // Intraday without being paged by it.
+      if (profile.alerts?.telegram !== false) newlyLocked.push({ profile, entry });
+    }
+
+    if (newlyLocked.length) {
+      tally.candidates++;
+      // Best evidence first, so a combined alert leads with the strongest leg.
+      newlyLocked.sort((a, b) => (b.entry.confidence?.score ?? 0) - (a.entry.confidence?.score ?? 0));
+      pending.push({ symbol: s.symbol, legs: newlyLocked, price: s.price, volume: s.volToday });
     }
     s.profileResults = results;
     // Flat list of the profiles this symbol currently satisfies — an "All
@@ -444,8 +474,66 @@ function scan() {
       if (d) s.decisions[id] = d;
     }
   }
-  scanExits();
+
+  deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tally, now });
+  scanExits(windowOpen);
 }
+
+/* Everything between "a signal happened" and "the user's phone buzzes".
+   Recording already happened above; nothing here can change the track record. */
+function deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tally, now }) {
+  const tg = config.alerts?.telegram;
+  const armed = !!tg?.on;
+
+  const sendable = [];
+  for (const p of pending) {
+    if (!windowOpen) { suppressInto(tally, win.reason || "outside market hours"); continue; }
+    if (stale) { suppressInto(tally, "stale snapshot"); continue; }
+    // A tape that has not moved carries no new information, whatever the
+    // criteria say about it.
+    if (!gate.inputsChanged(p.symbol, p.price, p.volume)) { suppressInto(tally, "unchanged inputs"); continue; }
+    const block = gate.deliveryBlock(p.symbol, now, limits);
+    if (block) { suppressInto(tally, block); continue; }
+    sendable.push(p);
+  }
+
+  // A flood is worse than a summary: past the per-cycle cap the rest become one
+  // line rather than fifteen notifications nobody reads.
+  const cap = limits.maxPerCycle ?? 5;
+  const send = sendable.slice(0, cap);
+  const overflow = sendable.slice(cap);
+
+  if (armed) {
+    for (const p of send) {
+      const lead = p.legs[0].entry;
+      const names = p.legs.map(l => l.profile.name);
+      const entry = { ...lead, profileName: names.join(" + "), profiles: names };
+      notify(tg, entry).catch(e => console.error("[alert]", e.message));
+      gate.recordSent(p.symbol, p.legs.map(l => l.entry.profileId), now);
+      tally.sent++;
+    }
+    if (overflow.length) {
+      const names = overflow.map(p => p.symbol).join(", ");
+      notifyBrief(tg, `👁 <b>TRINETRA</b>\n\n${overflow.length} more stock${overflow.length === 1 ? "" : "s"} locked this cycle — ${names}.\nOpen Trinetra for the detail.`)
+        .catch(e => console.error("[alert]", e.message));
+      for (const p of overflow) gate.recordSent(p.symbol, p.legs.map(l => l.entry.profileId), now);
+      suppressInto(tally, `digested(${overflow.length})`);
+    }
+  } else if (send.length || overflow.length) {
+    suppressInto(tally, "telegram not configured");
+  }
+
+  // One line per cycle, not per stock: the log has to answer "why did/didn't I
+  // get an alert" at a glance.
+  const parts = Object.entries(tally.suppressed).map(([r, n]) => `suppressed(${r})=${n}`);
+  if (tally.candidates || tally.sent || parts.length) {
+    console.log(`[alerts] window=${windowOpen ? "open" : `closed:${win.reason}`} · age=${Math.round(snapshotAgeMin)}m · candidates=${tally.candidates} · sent=${tally.sent}${parts.length ? " · " + parts.join(" · ") : ""}`);
+  }
+  lastAlertTally = { at: now, windowOpen, reason: win.reason, ...tally };
+}
+
+const suppressInto = (tally, reason) => { tally.suppressed[reason] = (tally.suppressed[reason] || 0) + 1; };
+let lastAlertTally = null;
 
 /* Exit signals are deduped per rule per holding: an alert that repeats every
    minute is one the user learns to ignore, which is the failure mode that
@@ -453,7 +541,7 @@ function scan() {
 const exitAlerted = new Set();
 let activeExits = [];
 
-function scanExits() {
+function scanExits(windowOpen = true) {
   const bySymbol = Object.fromEntries(snapshot.data.map(q => [q.symbol, q]));
   activeExits = evaluateExits(
     holdings.open(), bySymbol,
@@ -465,9 +553,14 @@ function scanExits() {
     config.exitRules
   );
 
+  /* Exit alerts are edge-triggered and durably deduped: once when a rule first
+     trips for a holding, never again while the condition persists, and not
+     re-announced after a restart. An armed rule is a status, not an event, so
+     it is never delivered. */
   for (const e of activeExits) {
-    if (exitAlerted.has(e.id)) continue;
-    exitAlerted.add(e.id);
+    if (e.fired === false) continue;
+    if (!gate.isNewExit(e.id)) continue;
+    if (!windowOpen) { console.log(`[alerts] exit ${e.symbol}/${e.rule} recorded, delivery suppressed — outside market hours`); continue; }
     if (config.alerts?.telegram?.on) {
       notifyExit(config.alerts.telegram, e).catch(err => console.error("[alert]", err.message));
     }
@@ -845,6 +938,13 @@ app.get("/decision", (req, res) => {
   });
 });
 
+app.get("/alerts/status", (_, res) => res.json({
+  ...gate.status(config.alertLimits),
+  override: process.env.ALERT_HOURS_OVERRIDE === "true",
+  telegramArmed: !!config.alerts?.telegram?.on,
+  lastCycle: lastAlertTally,
+}));
+
 app.get("/settings/sizing", (_, res) => res.json(config.sizing));
 app.post("/settings/sizing", (req, res) => {
   for (const k of ["capital", "riskPerTradePct", "defaultStopPct", "sectorLimitPct"])
@@ -1100,6 +1200,12 @@ app.post("/config", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`[trinetra] listening :${PORT} · provider=${PROVIDER}`);
+  const hol = gate.loadHolidays();
+  gate.loadLedger();
+  console.log(hol
+    ? `[alerts] window Mon-Fri 09:15-15:30 IST · ${hol.dates?.length ?? 0} holidays loaded (${hol.year ?? "?"})`
+    : "[alerts] window Mon-Fri 09:15-15:30 IST · no holiday file — weekday logic only, alerts can fire on a market holiday");
+  if (process.env.ALERT_HOURS_OVERRIDE === "true") console.warn("[alerts] ALERT_HOURS_OVERRIDE=true — the market-hours gate is OFF");
   await refresh();
   // Anything still on seed values gets scraped now, so an unverified gate is a
   // state the instrument passes through rather than one it sits in.

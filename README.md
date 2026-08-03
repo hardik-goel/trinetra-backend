@@ -109,6 +109,60 @@ while the staleness is impossible to overlook. So:
 Set `PROVIDER=kite` and the lag collapses, the cap lifts automatically, and the
 order-flow criteria start returning data. No code change.
 
+## When alerts fire (and when they deliberately do not)
+The scan runs 24/7 so the track record stays complete. **Delivery** is a separate
+question, and conflating the two is what produced evening alerts about a stock
+that stopped moving at 15:30, repeated every minute.
+
+**Window.** Alerts deliver only Mon–Fri **09:15–15:30 IST**, computed from UTC —
+the server clock is UTC on Render, and a day boundary taken from local time would
+roll at 05:30 IST. Outside the window signals are still recorded and still appear
+in Track Record; only delivery is suppressed, logged once per cycle rather than
+once per stock.
+
+**Edge, not level.** An alert fires when a stock *becomes* locked, never while it
+stays locked. A level-triggered alert repeats forever, because "criteria are
+true" remains true after the tape stops. The same rule governs exit signals: once
+when a rule first trips, not on every refresh.
+
+**Durable ledger.** `data/alert_ledger.json` survives restarts. A free-tier
+instance sleeps and wakes many times a day, and an in-memory ledger meant every
+wake re-alerted everything currently qualifying.
+
+**Limits** (in `config.default.json`, editable via `/config`):
+
+| setting | default | meaning |
+|---------|---------|---------|
+| `cooldownMinutes` | 240 | same symbol stays quiet this long, across all profiles |
+| `maxPerSymbolPerDay` | 1 | one entry alert per symbol per trading day |
+| `maxPerCycle` | 5 | beyond this, the rest become one digest line |
+| `maxPerHour` | 15 | hard ceiling |
+| `staleAfterMinutes` | 10 | no alert off a snapshot older than this |
+| `preOpenBufferMinutes` / `postCloseGraceMinutes` | 0 | widen the window if wanted |
+
+A stock locking several profiles at once produces **one** alert naming all of
+them, not one per profile. A profile can be scanned but silent via
+`alerts.telegram: false` — useful while validating Intraday.
+
+**Holidays.** `market_holidays.json` at the repo root, overridable by a runtime
+copy in `data/`. It seeds **only fixed-date national holidays** — Republic Day,
+Independence Day, Gandhi Jayanti — because those are the only ones that can be
+stated without a calendar. Holi, Diwali, Id and the rest move every year and are
+deliberately absent: a guessed date either silences a real trading day or lets
+alerts fire on a closed one. **Copy the rest from the NSE circular each January.**
+With no file at all the gate falls back to weekday-only and says so at startup.
+
+`GET /alerts/status` reports whether the window is open, the next open, counts
+sent today and this hour, active cooldowns, the limits, and whether holidays are
+configured. Set `ALERT_HOURS_OVERRIDE=true` to bypass the window for testing —
+startup warns loudly when it is on.
+
+Every cycle logs one line:
+```
+[alerts] window=open · age=0m · candidates=10 · sent=5 · suppressed(digested(5))=1
+[alerts] window=closed:after close · age=2m · candidates=3 · sent=0 · suppressed(after close)=3
+```
+
 ## Holdings and exit signals
 Marking a holding is one tap — `POST /holdings { symbol }`. Entry price, the
 levels, and **the criteria that were locked at that moment** are captured from

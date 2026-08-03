@@ -383,3 +383,18 @@ one: "Download backup" before a deploy, "Restore from file" after.
 `Authorization: Bearer …`) matching the service's `BACKUP_TOKEN`. With that env
 var unset both return **503** rather than serving — they expose and can destroy
 the whole trading record, and CORS does not protect a non-browser caller.
+
+### `GET /alerts/status`
+```json
+{ "windowOpen": false, "reason": "after close", "tradingDay": "2026-08-03",
+  "nextOpen": "2026-08-04T09:15+05:30", "sentToday": 2, "sentLastHour": 0,
+  "activeCooldowns": [ { "symbol": "POLYCAB", "minutesRemaining": 180 } ],
+  "limits": { "cooldownMinutes": 240, "maxPerCycle": 5, "…": 0 },
+  "holidays": { "configured": true, "count": 3 },
+  "override": false, "telegramArmed": true,
+  "lastCycle": { "candidates": 3, "sent": 0, "suppressed": { "after close": 3 } } }
+```
+Alerts deliver only Mon–Fri 09:15–15:30 IST and are edge-triggered. Signals are
+still **recorded** outside the window — suppression is about delivery, so Track
+Record stays complete. Worth surfacing `windowOpen` + `nextOpen` in the UI, or a
+quiet evening looks like a broken backend.

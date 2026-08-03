@@ -24,6 +24,7 @@ import { stooqEod } from "./providers/stooqEod.js";
 import { kite } from "./providers/kite.js";
 import { evaluate } from "./lib/engine.js";
 import { notify, notifyExit, notifyBrief } from "./lib/alerts.js";
+import { digestLine } from "./lib/alertFormat.js";
 import { cachedForecasts, ensureForecasts, mergeForecasts } from "./lib/oracle.js";
 import { startKeepAlive } from "./lib/keepalive.js";
 import { fetchFundamentals } from "./lib/fundamentals.js";
@@ -472,6 +473,19 @@ function scan() {
         count: ev.count, total: ev.total, at: Date.now(),
         lockQuality: ev.lockQuality, lockedOn: ev.lockedOn, notEvaluated: ev.notEvaluated,
         criteriaWarnings: ev.warnings,
+        // The criteria block in the alert needs the values that made each check
+        // pass, not just the criterion names.
+        criteriaDetail: ev.criteria,
+        /* Every existing criterion detects upward setups — a breakout above the
+           20-day high, volume expansion on strength, buyer-side flow. There is
+           no bearish screening, so nothing here can produce "sell". The field
+           exists because the SELL rendering path is built and waiting; it is not
+           inferred by inverting a bullish signal. */
+        direction: "buy",
+        entryPrice: pot?.triggerPrice ?? null,
+        exitPrice: exits?.primary?.price ?? null,
+        potentialLeftPct: exits?.primary?.pct ?? null,
+        appUrl: process.env.APP_URL || null,
         dataAge: age,
         potential: pot, confidence: conf, exits,
         // Intraday on a delayed feed is the user's explicit choice. It is
@@ -533,8 +547,17 @@ function deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tall
   const tg = config.alerts?.telegram;
   const armed = !!tg?.on;
 
+  const MIN_POTENTIAL_PCT = +(process.env.MIN_POTENTIAL_PCT ?? 5);
   const sendable = [];
   for (const p of pending) {
+    /* Actionability gate. A setup with 2% left is not worth a notification, and
+       an alert that cannot be acted on teaches the user to ignore the ones that
+       can. Delivery only — the signal is already in history above, so the track
+       record stays complete either way. When potential cannot be computed the
+       alert still goes: the criteria lock is real information, and the message
+       says "not established" rather than implying a number. */
+    const left = p.legs[0].entry.potentialLeftPct;
+    if (left != null && left < MIN_POTENTIAL_PCT) { suppressInto(tally, `potential < ${MIN_POTENTIAL_PCT}%`); continue; }
     if (!windowOpen) { suppressInto(tally, win.reason || "outside market hours"); continue; }
     if (stale) { suppressInto(tally, "stale snapshot"); continue; }
     // A tape that has not moved carries no new information, whatever the
@@ -556,13 +579,13 @@ function deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tall
       const lead = p.legs[0].entry;
       const names = p.legs.map(l => l.profile.name);
       const entry = { ...lead, profileName: names.join(" + "), profiles: names };
-      notify(tg, entry).catch(e => console.error("[alert]", e.message));
+      notify(tg, entry, snapshot.data.find(q => q.symbol === p.symbol)).catch(e => console.error("[alert]", e.message));
       gate.recordSent(p.symbol, p.legs.map(l => l.entry.profileId), now);
       tally.sent++;
     }
     if (overflow.length) {
-      const names = overflow.map(p => p.symbol).join(", ");
-      notifyBrief(tg, `👁 <b>TRINETRA</b>\n\n${overflow.length} more stock${overflow.length === 1 ? "" : "s"} locked this cycle — ${names}.\nOpen Trinetra for the detail.`)
+      const lines = overflow.map(p => digestLine(p.legs[0].entry)).join("\n");
+      notifyBrief(tg, `👁 <b>TRINETRA</b> · ${overflow.length} more locked\n\n${lines}\n\n<i>Open Trinetra for the detail.</i>`)
         .catch(e => console.error("[alert]", e.message));
       for (const p of overflow) gate.recordSent(p.symbol, p.legs.map(l => l.entry.profileId), now);
       suppressInto(tally, `digested(${overflow.length})`);

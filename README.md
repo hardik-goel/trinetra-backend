@@ -112,11 +112,13 @@ missing drops out of the lock, so a stock can lock on the rest. `evaluation.skip
 names those, and the UI is expected to show it — "locked" then means "locked on
 what could be measured".
 
-**Seed fundamentals are treated the same way.** Hand-entered values that no scrape
-has confirmed no longer fail the criterion; they exclude it, with a warning. That
-is a deliberate reversal of the earlier behaviour, where unverified values vetoed
-the gate and an unscraped stock could never fire. Startup scrapes the universe, so
-`seed` is a state the instrument passes through rather than sits in.
+**Seed fundamentals are judged, not excluded.** "Unverified" and "unavailable"
+are different claims: a hand-entered ROE of 22 is a number and can be compared
+against a threshold of 15; a null cannot be compared against anything. So a seed
+value passes or fails on its merits and is flagged `unverified` for provenance,
+while only genuine nulls are excluded from the lock. Excluding both would treat a
+typed number as though it did not exist and would give up the quality filter in
+the one case where it still works.
 
 **But a partial lock never masquerades as a full one.** Every evaluation carries
 `lockQuality: "full" | "partial"`, plus `lockedOn[]` and `notEvaluated[]`, and the
@@ -167,6 +169,62 @@ while the staleness is impossible to overlook. So:
 
 Set `PROVIDER=kite` and the lag collapses, the cap lifts automatically, and the
 order-flow criteria start returning data. No code change.
+
+## What an alert looks like
+One alert, one stock, nothing that cannot be acted on:
+
+```
+👁 TRINETRA · BUY · SWING
+POLYCAB · Polycab India
+
+✓ Fundamentals    ROE 22.7% · D/E 0.01 · growth 26.0% · promoter 61.0%
+✓ Breakout        ₹9,106 above 20d high ₹8,940 · +2.4% today · 96% of 52-week high
+✓ Volume shocker  4.2× the 20-day average
+— Order flow      order-book depth needs Kite — not available on a delayed feed
+
+Entry     ₹8,940
+Current   ₹9,106  (+1.9% from entry)
+Exit      ₹9,890  (target — above entry)
+Potential 8.6% left
+Horizon   3–5 days  (typically reached in 4 sessions)
+Confidence 62% (moderate)
+
+12:52 IST · prices ~15 min delayed
+```
+
+The criteria block is the point. "Fundamentals ✓" says nothing; the numbers that
+made it lock are what let you disagree with the machine. Evidence stacks,
+convergence counts and component breakdowns are deliberately absent — they live in
+the app.
+
+**The horizon parenthetical only appears when the analog history supports it**
+(n ≥ 8). Below that the profile horizon is shown alone rather than a timing figure
+being invented.
+
+**`— Order flow`** is shown but not counted. The header count reads 3/3, never 3/4
+with an eternally unreachable fourth. That criterion was in the original four; it
+needs live exchange depth, so it becomes real with Kite and is inert until then.
+
+**`MIN_POTENTIAL_PCT`** (default 5) gates delivery: a setup with 2% left is not
+worth a notification, and an alert that cannot be acted on teaches you to ignore
+the ones that can. **It gates delivery only — every signal is still recorded**, so
+Track Record stays complete. Suppressions appear in the cycle line:
+`suppressed(potential < 5%)=3`. When potential cannot be computed the alert still
+sends, marked `Potential not established`.
+
+### BUY, SELL, and closing a position
+- **BUY** — exit above entry, potential measured upward. Every current signal.
+- **SELL** — exit below entry, potential measured downward. The path is fully
+  built and **inert**: every existing criterion detects upward setups only
+  (breakout above the 20-day high, volume expansion on strength, buyer-side flow),
+  so nothing can produce one. A bullish signal is never inverted to manufacture a
+  bearish idea. When bearish criteria are built, note that Indian cash-segment
+  shorts cannot be held overnight — intraday only unless trading F&O — so any
+  bearish swing or positional signal needs that caveat attached.
+- **⚠ CLOSE POSITION** — an exit rule tripping on something you already hold.
+  A different thing from a bearish setup and headed differently so it cannot be
+  misread as one. These keep their full reasoning sentence; that sentence is the
+  entire value of the alert.
 
 ## When alerts fire (and when they deliberately do not)
 The scan runs 24/7 so the track record stays complete. **Delivery** is a separate

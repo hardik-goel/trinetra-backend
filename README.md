@@ -118,6 +118,19 @@ is a deliberate reversal of the earlier behaviour, where unverified values vetoe
 the gate and an unscraped stock could never fire. Startup scrapes the universe, so
 `seed` is a state the instrument passes through rather than sits in.
 
+**But a partial lock never masquerades as a full one.** Every evaluation carries
+`lockQuality: "full" | "partial"`, plus `lockedOn[]` and `notEvaluated[]`, and the
+Telegram alert says so directly:
+
+```
+Locked on 2 of 3 criteria · volume 3.5x avg
+⚠ Not evaluated: Fundamentals — no data, so it could not be judged either way.
+```
+
+That is the honest resolution of the tension. A criterion that cannot be evaluated
+must not hold the door shut, and a door opened with one gate unchecked must not
+look like a door that passed all three.
+
 ## Criteria profiles (multi-horizon)
 One criteria set forced one answer to four different questions. There are now
 four profiles, each evaluated independently against every stock, each with its

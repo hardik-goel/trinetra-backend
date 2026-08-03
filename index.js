@@ -461,6 +461,8 @@ function scan() {
         profileId: id, profileName: profile.name, horizon: profile.horizon,
         volX: +(ev.volX || 0).toFixed(1), dayChg: +(ev.dayChg || 0).toFixed(1),
         count: ev.count, total: ev.total, at: Date.now(),
+        lockQuality: ev.lockQuality, lockedOn: ev.lockedOn, notEvaluated: ev.notEvaluated,
+        criteriaWarnings: ev.warnings,
         dataAge: age,
         potential: pot, confidence: conf, exits,
         // Intraday on a delayed feed is the user's explicit choice. It is

@@ -51,6 +51,8 @@ import * as pravesh from "./lib/praveshTrigger.js";
 import * as cycle from "./lib/cycle.js";
 import { resistanceAbove } from "./lib/analysis.js";
 import { trendIntact as trendOf } from "./lib/indicators.js";
+import { analyse as analyseCandlesFor } from "./lib/candles.js";
+import { candidates as levelCandidatesFor } from "./lib/levels.js";
 import { build as buildPlaybook } from "./lib/playbook.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -630,7 +632,18 @@ function cycleContextFor(stock, holding) {
   const swingLow = stock.low20 ?? null;
   const runPct = swingLow ? ((price - swingLow) / swingLow) * 100 : null;
 
+  /* Context-valid reversal candles formed at a level. `valid` already excludes
+     detections with no move to reverse; this additionally requires the candle to
+     have formed AT a level, since a reversal in mid-range corroborates nothing. */
+  const lv = levelCandidatesFor(stock);
+  const det = lv.insufficient ? { valid: [] } : analyseCandlesFor(stock, lv.candidates, { lookback: 3 });
+  const atLevel = (dir) => (det.valid || []).find(d => d.direction === dir && d.atLevel);
+  const bearC = atLevel("bearish"), bullC = atLevel("bullish");
+
   return {
+    bearishCandleAtResistance: bearC ? 1 : undefined,
+    bullishCandleAtSupport: bullC ? 1 : undefined,
+    candleReading: bearC?.reading || bullC?.reading || null,
     atResistancePct: res ? Math.abs(((res.price - price) / price) * 100) : undefined,
     resistanceLevel: res ? { name: res.name, price: Math.round(res.price * 100) / 100 } : null,
     supportLevel: sup ? Math.round(sup * 100) / 100 : null,
@@ -666,6 +679,9 @@ function scanCycles() {
         name: c.name, pass: !!c.pass, skipped: !!c.skipped,
         detail: (c.checksOut || []).map(x => cycleDetail(x, stock, ctx, h)).filter(Boolean).join(" · "),
       })),
+      // Shown whether or not the criterion is enabled: it is evidence either way,
+      // and its absence is worth seeing too.
+      candleReading: ctx.candleReading,
       dataAge: dataAge(), at: Date.now(),
     });
 
@@ -704,6 +720,9 @@ function scanCycles() {
           sellPrice: h.cycle?.sellPrice ?? null,
           trendIntact: !!trend?.intact,
           suggestion: "consider buying back toward your core size",
+          /* A stock the user has actually trimmed is the one this feature exists
+             for — the round trip is open and this is the half that closes it. */
+          priority: h.cycle?.status === "partly sold" ? "high" : "normal",
           cycle: derived,
         });
       }
@@ -738,6 +757,8 @@ function cycleDetail(chk, stock, ctx, h) {
     case "trendIntact": return v ? "above the 50-day average" : "below the 50-day average";
     case "volumeClimax": return `${v.toFixed(1)}× volume with an exhaustion shape`;
     case "volumeDryUpThenExpansion": return "dry-up through the fall, expansion today";
+    case "bearishCandleAtResistance": case "bullishCandleAtSupport":
+      return ctx.candleReading || "reversal candle at the level";
     default: return `${chk.metric} ${v}`;
   }
 }

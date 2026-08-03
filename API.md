@@ -513,6 +513,12 @@ PATCH /holdings/:id             { purchaseDate }   → fixes the STCG basis
 Price defaults to the current mark. Quantity is optional; without it rupee figures
 are `null` and only percentages are honest (`qtyKnown: false`).
 
+Every cycle signal also carries **`candleReading`** — the context-valid reversal
+candle at the level, if one formed — whether or not the `Candles` criterion is
+enabled. It is corroboration either way, and its absence is worth seeing.
+`buyBack` items carry **`priority: "high" | "normal"`**; high when the holding is
+already `partly sold`, since that is the half that closes an open round trip.
+
 ### Profiles
 `sell_holdings` and `buyback_holdings` arrive in `GET /profiles` with
 `appliesTo: "holdings"` — evaluated only for held symbols, and never offered for

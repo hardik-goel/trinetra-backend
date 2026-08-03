@@ -569,16 +569,26 @@ from `/analysts`**, which is keyed on symbol: an unlisted IPO has no ticker, so
   "limits": [ "Google News RSS returns headline and summary only …", … ] }
 ```
 
-**The field that matters is `blocked`, and `verdict` states it in words — render it.**
-Zero calls has two causes that mean opposite things:
+**Branch on `certainty`, not on `calls.length`, and never on `ok`.** `ok: true`
+coexists with every route 403ing — it means "the fetch succeeded and Pravesh
+recorded no failure", and NO_VIEW everywhere is deliberately not a failure.
 
-- `blocked: true` — every route 403'd or timed out. The absence of expert views says
-  **nothing**. Do not render "no expert view"; render "could not check".
-- `blocked: false` with no calls — the routes answered and carried no explicit stance.
-  That is a real coverage absence and can be shown as such.
+| `certainty` | meaning | render |
+|---|---|---|
+| `"full"` | every route answered every query | "no expert view" — a real absence |
+| `"per-issue"` | `perIpo[slug].reachable` is authoritative | per issue; **ignore the source-level flags** |
+| `"partial"` | some queries went unanswered | "partly checked" — for an issue with no call you cannot say which it was |
+| `"none"` | nothing answered (`blocked: true`) | "could not check" — the absence says **nothing** |
 
-Collapsing those two into an empty state would launder a broken scraper into an
-opinion, which is the failure this endpoint is shaped to prevent.
+`verdict` states the same thing in a sentence; render it verbatim if you need one line.
+
+`"partial"` is the normal case, not an edge: Google News RSS rate-limits under
+repeated querying and routinely answers 2 of 4 queries. Source-level counts cannot
+tell you *which* issues went unasked — only that some did. Until Pravesh publishes
+`expert_reachability`, an issue with no call under `"partial"` is genuinely unknown,
+and showing it as "no expert view" would launder a rate-limited scraper into an
+opinion. That is the failure this endpoint is shaped to prevent, and it survives one
+level down from the source-level flag if you branch on `blocked` alone.
 
 Other honest limits, all in `limits[]` and worth surfacing near the calls:
 

@@ -576,13 +576,29 @@ recorded no failure", and NO_VIEW everywhere is deliberately not a failure.
 | `certainty` | meaning | render |
 |---|---|---|
 | `"full"` | every route answered every query | "no expert view" — a real absence |
-| `"per-issue"` | `perIpo[slug].reachable` is authoritative | per issue; **ignore the source-level flags** |
+| `"per-issue"` | `perIpo[slug]` is authoritative | per issue; **ignore the source-level flags** |
 | `"partial"` | some queries went unanswered | "partly checked" — for an issue with no call you cannot say which it was |
 | `"none"` | nothing answered (`blocked: true`) | "could not check" — the absence says **nothing** |
 
 `verdict` states the same thing in a sentence; render it verbatim if you need one line.
 
-`"partial"` is the normal case, not an edge: Google News RSS rate-limits under
+Under `"per-issue"`, each entry in `perIpo` has its own three-state `status` plus a
+ready-made `meaning` sentence, and `perIpoSummary` gives `{ total, checked, partly,
+unchecked }`:
+
+| `status` | `meaning` |
+|---|---|
+| `"checked"` | every expert was asked — an empty result is a real absence |
+| `"partly"` | some experts asked, some not — a view from half the panel |
+| `"unchecked"` | nothing answered — the absence carries **no** information |
+
+The gap this closes is large, not marginal. On Pravesh's 13-issue run the aggregate
+computed `blocked: false` (two experts did answer, on one issue), which would have
+rendered "no expert view" for all 13. Per-issue: **1 fully checked, 1 partly, 11 not
+checked at all.** Twelve of thirteen would have been wrong.
+
+`"partial"` is the fallback when Pravesh has not published per-issue data. It is the
+normal case there, not an edge: Google News RSS rate-limits under
 repeated querying and routinely answers 2 of 4 queries. Source-level counts cannot
 tell you *which* issues went unasked — only that some did. Until Pravesh publishes
 `expert_reachability`, an issue with no call under `"partial"` is genuinely unknown,

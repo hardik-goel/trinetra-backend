@@ -23,7 +23,7 @@ import { yahooDelayed } from "./providers/yahooDelayed.js";
 import { stooqEod } from "./providers/stooqEod.js";
 import { kite } from "./providers/kite.js";
 import { evaluate } from "./lib/engine.js";
-import { notify, notifyExit, notifyBrief } from "./lib/alerts.js";
+import { notify, notifyExit, notifyBrief, notifyCycle } from "./lib/alerts.js";
 import { digestLine } from "./lib/alertFormat.js";
 import { cachedForecasts, ensureForecasts, mergeForecasts } from "./lib/oracle.js";
 import { startKeepAlive } from "./lib/keepalive.js";
@@ -48,6 +48,9 @@ import { suggest as suggestSize, concentration as computeConcentration, DEFAULT_
 import * as gate from "./lib/alertgate.js";
 import * as analysts from "./lib/analysts.js";
 import * as pravesh from "./lib/praveshTrigger.js";
+import * as cycle from "./lib/cycle.js";
+import { resistanceAbove } from "./lib/analysis.js";
+import { trendIntact as trendOf } from "./lib/indicators.js";
 import { build as buildPlaybook } from "./lib/playbook.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -539,6 +542,7 @@ function scan() {
 
   deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tally, now });
   scanExits(windowOpen);
+  scanCycles();
 }
 
 /* Everything between "a signal happened" and "the user's phone buzzes".
@@ -605,6 +609,150 @@ function deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tall
 
 const suppressInto = (tally, reason) => { tally.suppressed[reason] = (tally.suppressed[reason] || 0) + 1; };
 let lastAlertTally = null;
+
+/* Holdings-only signals: trimming a core position and buying it back.
+   Evaluated ONLY for symbols the user holds — that restriction is what keeps a
+   SELL from ever being a short recommendation. */
+let cycleSignals = { sell: [], buyBack: [], suppressed: [] };
+
+function cycleContextFor(stock, holding) {
+  const price = stock.price;
+  const res = resistanceAbove(stock, stock.candles);
+  const sup = (() => {
+    // Nearest level below price, from the same structure the levels engine uses.
+    const cands = [stock.high20, stock.low20, stock.high50, trendOf(stock.candles, price, 20)?.ma,
+                   trendOf(stock.candles, price, 50)?.ma].filter(v => Number.isFinite(v) && v < price);
+    return cands.length ? Math.max(...cands) : null;
+  })();
+  const analog = decisionCache && null; // analogs come via potential() below
+  const pot = potential(stock, { horizon: "swing", triggerPrice: stock.high20 });
+  const medianMFE = pot?.analogs?.medianMFE ?? null;
+  const swingLow = stock.low20 ?? null;
+  const runPct = swingLow ? ((price - swingLow) / swingLow) * 100 : null;
+
+  return {
+    atResistancePct: res ? Math.abs(((res.price - price) / price) * 100) : undefined,
+    resistanceLevel: res ? { name: res.name, price: Math.round(res.price * 100) / 100 } : null,
+    supportLevel: sup ? Math.round(sup * 100) / 100 : null,
+    pullbackToSupportPct: sup ? Math.abs(((price - sup) / price) * 100) : undefined,
+    // "This run is already longer than this stock usually manages" — expressed as
+    // a percentage OF the median analog move, so 100 means at the median.
+    gainVsAnalogMedian: medianMFE && runPct != null ? (runPct / medianMFE) * 100 : undefined,
+    gainVsHoldingEntry: holding?.entryPrice ? ((price - holding.entryPrice) / holding.entryPrice) * 100 : undefined,
+    retraceVsSalePct: holding?.cycle?.sellPrice ? ((price - holding.cycle.sellPrice) / holding.cycle.sellPrice) * 100 : undefined,
+  };
+}
+
+function scanCycles() {
+  const bySymbol = stockBySymbol();
+  const out = { sell: [], buyBack: [], suppressed: [] };
+  const sellP = config.profiles.sell_holdings, buyP = config.profiles.buyback_holdings;
+
+  for (const h of holdings.open()) {
+    const stock = bySymbol[h.symbol];
+    if (!stock) continue;
+    const ctx = cycleContextFor(stock, h);
+    const withCtx = { ...stock, cycleCtx: ctx };
+    const period = cycle.holdingPeriod(h);
+    const derived = cycle.derive(h, stock.price);
+
+    const render = (ev, kind) => ({
+      id: `cyc_${kind}_${h.id}`,
+      holdingId: h.id, symbol: h.symbol, kind,
+      subtitle: kind === "sell" ? "sell a portion of your holding" : "buy back what you sold",
+      // Failed checks travel too: three of four is not four of four, and the
+      // fourth is worth seeing.
+      criteria: ev.criteria.map(c => ({
+        name: c.name, pass: !!c.pass, skipped: !!c.skipped,
+        detail: (c.checksOut || []).map(x => cycleDetail(x, stock, ctx, h)).filter(Boolean).join(" · "),
+      })),
+      dataAge: dataAge(), at: Date.now(),
+    });
+
+    if (sellP?.enabled !== false) {
+      const ev = evaluate(withCtx, sellP.criteria);
+      if (ev.locked) out.sell.push({
+        ...render(ev, "sell"),
+        holding: {
+          entryPrice: h.entryPrice, currentPrice: stock.price,
+          gainPct: Math.round(((stock.price - h.entryPrice) / h.entryPrice) * 1000) / 10,
+          heldMonths: period?.months ?? null, stcg: !!period?.stcg, holdingPeriod: period,
+        },
+        reasoning: sellReasoning(stock, ctx, ev, h, period),
+        suggestion: "consider selling a portion; core stays",
+        reentryRisk: cycle.REENTRY_RISK,
+        cycle: derived,
+      });
+    }
+
+    if (buyP?.enabled !== false) {
+      const ev = evaluate(withCtx, buyP.criteria);
+      const trend = trendOf(stock.candles, stock.price, 50);
+      /* A pullback inside an uptrend is an opportunity; the same fall below the
+         trend is a falling knife. Withheld rather than fired — and SAID, because
+         silence would read as "no pullback yet". */
+      if (trend && !trend.intact) {
+        out.suppressed.push({
+          symbol: h.symbol, holdingId: h.id, kind: "buyBack",
+          reason: "trend broken — no re-entry signal",
+          detail: `Price ₹${stock.price} is below the 50-day average of ₹${trend.ma}. This is a falling knife, not a pullback.`,
+        });
+      } else if (ev.locked) {
+        out.buyBack.push({
+          ...render(ev, "buyBack"),
+          belowSalePct: derived?.belowSalePct ?? null,
+          sellPrice: h.cycle?.sellPrice ?? null,
+          trendIntact: !!trend?.intact,
+          suggestion: "consider buying back toward your core size",
+          cycle: derived,
+        });
+      }
+    }
+  }
+
+  cycleSignals = out;
+  for (const sig of [...out.sell, ...out.buyBack]) {
+    if (!gate.isNewExit(sig.id + ":" + gate.tradingDay())) continue;
+    if (!gate.marketWindow(Date.now(), config.alertLimits).open &&
+        process.env.ALERT_HOURS_OVERRIDE !== "true") continue;
+    if (config.alerts?.telegram?.on) notifyCycle(config.alerts.telegram, sig).catch(e => console.error("[alert]", e.message));
+  }
+  return out;
+}
+
+function cycleDetail(chk, stock, ctx, h) {
+  if (chk.v == null) return null;
+  const v = chk.v;
+  switch (chk.metric) {
+    case "extensionVs20dma": return `${v.toFixed(1)}% above the 20-day average`;
+    case "extensionVs50dma": return `${v.toFixed(1)}% above the 50-day average`;
+    case "rsi14": return `RSI ${v.toFixed(0)}`;
+    case "rsiRecovery": return `RSI turning up at ${v.toFixed(0)}`;
+    case "atResistancePct": return ctx.resistanceLevel
+      ? `₹${ctx.resistanceLevel.price} — ${ctx.resistanceLevel.name}, ${v.toFixed(1)}% away` : `${v.toFixed(1)}% from resistance`;
+    case "pullbackToSupportPct": return ctx.supportLevel
+      ? `₹${ctx.supportLevel} — nearest support, ${v.toFixed(1)}% away` : `${v.toFixed(1)}% from support`;
+    case "gainVsAnalogMedian": return `run is ${v.toFixed(0)}% of this stock's median historical run`;
+    case "gainVsHoldingEntry": return `${v.toFixed(1)}% up from your entry at ₹${h.entryPrice}`;
+    case "retraceVsSalePrice": return `${Math.abs(v).toFixed(1)}% below your sale at ₹${h.cycle?.sellPrice}`;
+    case "trendIntact": return v ? "above the 50-day average" : "below the 50-day average";
+    case "volumeClimax": return `${v.toFixed(1)}× volume with an exhaustion shape`;
+    case "volumeDryUpThenExpansion": return "dry-up through the fall, expansion today";
+    default: return `${chk.metric} ${v}`;
+  }
+}
+
+function sellReasoning(stock, ctx, ev, h, period) {
+  const bits = [];
+  const passed = ev.criteria.filter(c => c.pass).map(c => c.name.toLowerCase());
+  bits.push(`${h.symbol} is ${(((stock.price - h.entryPrice) / h.entryPrice) * 100).toFixed(1)}% up from your entry at ₹${h.entryPrice}`);
+  if (ctx.resistanceLevel) bits.push(`and has reached ₹${ctx.resistanceLevel.price}, the ${ctx.resistanceLevel.name}`);
+  if (passed.length) bits.push(`— ${passed.join(", ")} all point to a local top`);
+  const s = bits.join(" ") + ".";
+  return period?.stcg
+    ? `${s} Held ${period.months} month${period.months === 1 ? "" : "s"}, so selling realises short-term gains.`
+    : s;
+}
 
 /* Exit signals are deduped per rule per holding: an alert that repeats every
    minute is one the user learns to ignore, which is the failure mode that
@@ -917,7 +1065,16 @@ app.delete("/profiles/:id", (req, res) => {
 
 const stockBySymbol = () => Object.fromEntries(snapshot.data.map(q => [q.symbol, q]));
 
-app.get("/holdings", (_, res) => res.json({ holdings: holdings.all() }));
+app.get("/holdings", (_, res) => {
+  const by = stockBySymbol();
+  res.json({
+    holdings: holdings.all().map(h => ({
+      ...h,
+      cycle: cycle.derive(h, by[h.symbol]?.price ?? h.entryPrice),
+      holdingPeriod: cycle.holdingPeriod(h),
+    })),
+  });
+});
 
 app.post("/holdings", (req, res) => {
   // One tap: { symbol } is enough. Entry price, the thesis and the levels the
@@ -948,6 +1105,33 @@ app.delete("/holdings/:id", (req, res) =>
    "trailing stop 1.2% away" can never be rendered with the same affordances as
    a rule that actually broke — the client should not have to remember to split
    on a flag to avoid offering "Mark closed" on a watch. */
+app.get("/cycle-signals", (_, res) => res.json({ ...cycleSignals, dataAge: dataAge() }));
+
+/* One tap each. Quantity is optional — the hold itself records none, so the
+   cycle works in percentage terms until a quantity is supplied at the moment it
+   actually exists. */
+app.post("/holdings/:id/sold", (req, res) => {
+  const h = holdings.find(req.params.id);
+  if (!h) return res.status(404).json({ error: "no such holding" });
+  const price = stockBySymbol()[h.symbol]?.price;
+  const c = cycle.recordSale(h, req.body || {}, price);
+  if (!c) return res.status(400).json({ error: "no current price and no price supplied" });
+  const updated = holdings.update(h.id, { cycle: c });
+  scanCycles();
+  res.json({ ...updated, cycle: cycle.derive(updated, price) });
+});
+
+app.post("/holdings/:id/bought-back", (req, res) => {
+  const h = holdings.find(req.params.id);
+  if (!h) return res.status(404).json({ error: "no such holding" });
+  const price = stockBySymbol()[h.symbol]?.price;
+  const c = cycle.recordBuyBack(h, req.body || {}, price);
+  if (!c) return res.status(400).json({ error: "nothing recorded as sold for this holding" });
+  const updated = holdings.update(h.id, { cycle: c });
+  scanCycles();
+  res.json({ ...updated, cycle: cycle.derive(updated, price) });
+});
+
 app.get("/exit-signals", (_, res) =>
   res.json({
     signals: activeExits.filter(e => e.fired !== false),

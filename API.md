@@ -449,3 +449,72 @@ on the live payload.
 `lockQuality: "partial"` means at least one criterion was excluded because it had
 no data. It is a materially different event from `"full"` and must not render
 identically — the excluded criterion is named in `notEvaluated[]`.
+
+---
+
+## Sell / buy-back cycle (trading around a core holding)
+
+Naming follows `trinetra-web/docs/CYCLE_CONTRACT.md`. **Note two fields where that
+doc and the summary message differed — the doc wins:**
+`kind` is **`"sell"` | `"buyBack"`** (not `sell_holding`/`buy_back`), and the field
+is **`reentryRisk`** (one capital, not `reEntryRisk`).
+
+### `GET /cycle-signals`
+```json
+{ "sell": [ { "id": "cyc_sell_hld_…", "holdingId": "hld_…", "symbol": "POLYCAB",
+    "kind": "sell", "subtitle": "sell a portion of your holding",
+    "criteria": [ { "name": "At resistance", "pass": true, "skipped": false,
+                    "detail": "₹9,890 — 52w-high, 0.4% away" } ],
+    "holding": { "entryPrice": 7240, "currentPrice": 9890, "gainPct": 36.6,
+                 "heldMonths": 4, "stcg": true, "holdingPeriod": { … } },
+    "reasoning": "…one sentence with the numbers in it…",
+    "suggestion": "consider selling a portion; core stays",
+    "reentryRisk": "If it keeps running, buying back may be higher than where you sold.",
+    "cycle": { … }, "dataAge": { … } } ],
+  "buyBack": [ { "kind": "buyBack", "subtitle": "buy back what you sold",
+                 "belowSalePct": -4.2, "sellPrice": 9890, "trendIntact": true, … } ],
+  "suppressed": [ { "symbol": "POLYCAB", "kind": "buyBack",
+                    "reason": "trend broken — no re-entry signal",
+                    "detail": "Price ₹9,056 is below the 50-day average of ₹9,442.51. This is a falling knife, not a pullback." } ] }
+```
+
+Kept out of `/exit-signals`, whose `signals[]` already means "a rule fired, consider
+exiting fully". `criteria[]` includes failed and skipped entries — three of four is
+not four of four.
+
+### `GET /holdings` — every row gains
+`cycle` (derived) and `holdingPeriod`:
+```json
+"cycle": { "status": "partly sold", "sellPrice": 9890, "belowSalePct": -4.23,
+           "realisedFromCycle": 6000, "realisedPctFromCycle": 2.27,
+           "cycleVsHold": -54000, "qtyKnown": true, "roundTrips": 1,
+           "notComparableReason": null, "counterfactualNote": "…" }
+"holdingPeriod": { "months": 42, "stcg": false, "measuredFrom": "purchaseDate",
+                   "caveat": null }
+```
+
+**`cycleVsHold` is rendered wherever `realisedFromCycle` is, same row, same weight.**
+Positive means the trimming beat holding; negative means holding would have won.
+Verified case: realised **+₹6,000** while `cycleVsHold` is **−₹54,000** — the
+flattering number and the honest one point opposite ways, which is exactly when the
+comparison matters. `null` with `notComparableReason` when there is no completed
+round trip, or no quantity.
+
+`measuredFrom: "markedAt"` carries a `caveat` — render it. A stock marked last week
+but held two years reads "0 months · STCG" and argues against a sale that is
+actually tax-favourable.
+
+### Actions
+```
+POST /holdings/:id/sold         { qty?, price? }   → updated holding with cycle
+POST /holdings/:id/bought-back  { qty?, price? }   → updated holding with cycle
+PATCH /holdings/:id             { purchaseDate }   → fixes the STCG basis
+```
+Price defaults to the current mark. Quantity is optional; without it rupee figures
+are `null` and only percentages are honest (`qtyKnown: false`).
+
+### Profiles
+`sell_holdings` and `buyback_holdings` arrive in `GET /profiles` with
+`appliesTo: "holdings"` — evaluated only for held symbols, and never offered for
+unheld ones. `matchesCanonical` still describes the core three, so the drift banner
+does not fire because these exist. Verified.

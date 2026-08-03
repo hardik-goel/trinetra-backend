@@ -715,6 +715,9 @@ function scanCycles() {
       // and its absence is worth seeing too.
       candleReading: ctx.candleReading,
       dataAge: dataAge(), at: Date.now(),
+      // Not serialised to the client — carried so the durable record holds the
+      // same evidence the signal fired on.
+      _ev: ev, _price: stock.price, _name: stock.name, _groups: stock.groups || [],
     });
 
     if (sellP?.enabled !== false) {
@@ -761,14 +764,45 @@ function scanCycles() {
     }
   }
 
-  cycleSignals = out;
+  // Strip the carried evidence before anything serialises these.
+  for (const sig of [...out.sell, ...out.buyBack]) {
+    sig._raw = { ev: sig._ev, price: sig._price, name: sig._name, groups: sig._groups };
+    delete sig._ev; delete sig._price; delete sig._name; delete sig._groups;
+  }
+
+  cycleSignals = {
+    ...out,
+    sell: out.sell.map(({ _raw, ...s }) => s),
+    buyBack: out.buyBack.map(({ _raw, ...s }) => s),
+  };
+
   for (const sig of [...out.sell, ...out.buyBack]) {
     if (!gate.isNewExit(sig.id + ":" + gate.tradingDay())) continue;
+
+    /* Recorded whether or not the alert goes out. The track record measures
+       whether the signal was right, not whether Telegram was awake — and without
+       this the sell side of byDirection stays permanently empty, which would read
+       as "no sell signals" rather than "sells were never scored". */
+    try {
+      const pr = sig.pricing;
+      history.recordSignal({
+        symbol: sig.symbol, name: sig._raw.name, price: sig._raw.price,
+        groups: sig._raw.groups, evaluation: sig._raw.ev, at: sig.at,
+        profileId: sig.kind === "sell" ? "sell_holdings" : "buyback_holdings",
+        horizon: "swing",
+        potential: pr ? { movePct: pr.movePct, downward: pr.downward, triggerPrice: pr.actionPrice } : null,
+        confidence: pr?.confidence ?? null,
+        exits: pr ? { primary: { price: pr.targetPrice, pct: pr.movePct } } : null,
+        dataAge: sig.dataAge,
+        direction: sig.direction,
+      });
+    } catch (e) { console.error("[history]", e.message); }
+
     if (!gate.marketWindow(Date.now(), config.alertLimits).open &&
         process.env.ALERT_HOURS_OVERRIDE !== "true") continue;
     if (config.alerts?.telegram?.on) notifyCycle(config.alerts.telegram, sig).catch(e => console.error("[alert]", e.message));
   }
-  return out;
+  return cycleSignals;
 }
 
 function cycleDetail(chk, stock, ctx, h) {

@@ -414,6 +414,12 @@ proposal, all additive:
   `convergence` is that list's length.
 - `exits.safe|primary|stretch` each carry `zone`, `mid`, `pct`, `anchor`,
   `convergence`, `families`, `evidence` — there is no flat `ladder` array.
+- **`/playbook/all` rows nest identically to `/playbook`**: `entry.*` and
+  `exits.{primary,stop,riskReward,riskRewardWarning,confidence}`. The compact row
+  briefly hoisted those to the top level, so a caller reading the nested shape got
+  an em dash from a row that had the numbers. One path works for both now.
+  `riskRewardWarning` is in the compact row as well — sub-1:1 is exactly the row a
+  fast scan of a table should not skip.
 - `candles.detected` includes context-INVALID patterns for transparency;
   `candles.valid` is the list that may be shown as evidence. Do not render
   `detected` as findings.

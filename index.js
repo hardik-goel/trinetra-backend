@@ -982,16 +982,30 @@ app.get("/playbook/all", (req, res) => {
       rows.push({ symbol: s.symbol, price: s.price, insufficient: true, reading: pb.reading });
       continue;
     }
+    /* Same nesting as /playbook. The compact row previously hoisted primary,
+       stop, riskReward and exitConfidence to the top level while the full
+       payload nested them under `exits` — the same concepts at two different
+       paths in one feature, which is a trap for anything binding both. A caller
+       reading the nested shape got an em dash from a row that had the numbers. */
     rows.push({
       symbol: pb.symbol, price: pb.price,
       entry: { kind: pb.entry.kind, zone: pb.entry.zone, triggered: pb.entry.triggered,
-               chasing: pb.entry.chasing, convergence: pb.entry.convergence,
+               chasing: pb.entry.chasing, warning: pb.entry.warning,
+               convergence: pb.entry.convergence, families: pb.entry.families,
                confidence: { score: pb.entry.confidence.score, band: pb.entry.confidence.band } },
-      primary: pb.exits.primary ? { zone: pb.exits.primary.zone, pct: pb.exits.primary.pct, convergence: pb.exits.primary.convergence } : null,
-      stop: { zone: pb.exits.stop.zone, pct: pb.exits.stop.pct },
-      riskReward: pb.exits.riskReward,
+      exits: {
+        primary: pb.exits.primary
+          ? { zone: pb.exits.primary.zone, pct: pb.exits.primary.pct,
+              convergence: pb.exits.primary.convergence, families: pb.exits.primary.families }
+          : null,
+        stop: { zone: pb.exits.stop.zone, pct: pb.exits.stop.pct },
+        riskReward: pb.exits.riskReward,
+        // Belongs in the compact row too: sub-1:1 is exactly the row a fast
+        // scan of a table should not skip past.
+        riskRewardWarning: pb.exits.riskRewardWarning,
+        confidence: { score: pb.exits.confidence.score, band: pb.exits.confidence.band },
+      },
       potential: pb.potential,
-      exitConfidence: { score: pb.exits.confidence.score, band: pb.exits.confidence.band },
       convergence: pb.convergence,
       reading: pb.reading,
     });

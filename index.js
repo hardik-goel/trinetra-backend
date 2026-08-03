@@ -41,7 +41,7 @@ import * as events from "./lib/events.js";
 import * as brief from "./lib/brief.js";
 import { evaluateAll as evaluateExits, DEFAULT_RULES as EXIT_RULES } from "./lib/exits.js";
 import { migrate as migrateProfiles, enabledProfiles, needsIntraday, cleanId, HORIZON_SESSIONS,
-         CANONICAL_CRITERIA, matchesCanonical, DATALESS_CRITERIA } from "./lib/profiles.js";
+         CANONICAL_CRITERIA, matchesCanonical, DATALESS_CRITERIA, originalFourStatus } from "./lib/profiles.js";
 import { potential, confidence, exitLevels, atrPct } from "./lib/analysis.js";
 import { derive as deriveIntraday } from "./lib/intraday.js";
 import { suggest as suggestSize, concentration as computeConcentration, DEFAULT_SIZING } from "./lib/sizing.js";
@@ -1032,6 +1032,9 @@ app.get("/profiles", (_, res) => res.json({
   // The dashboard shows a one-line banner when these differ, rather than
   // silently overriding a user who meant to change them.
   matchesCanonical: matchesCanonical(config.profiles?.swing?.criteria),
+  // The founding four, in the user's own words, with their live state — so the
+  // panel that pins them reads from the engine rather than a hardcoded list.
+  originalFour: originalFourStatus(config.profiles?.swing?.criteria, PROVIDER),
 }));
 
 /* One tap back to the instrument's original purpose: fundamentals, breakout,
@@ -1316,6 +1319,16 @@ app.post("/analysts", (req, res) => {
   if (!rec) return res.status(400).json({ error: "symbol and broker are required" });
   playbookCache.clear(); // a new target can move a level
   res.json(rec);
+});
+
+/* Named experts on a stock — Sandeep Jain, Anil Singhvi. Scored in the same
+   ledger as the brokerages, with the same n threshold. */
+app.post("/analysts/experts", async (req, res) => {
+  const sym = String(req.body?.symbol ?? "").trim().toUpperCase();
+  if (!sym) return res.status(400).json({ error: "symbol required" });
+  const out = await analysts.scrapeExperts(sym);
+  playbookCache.clear();
+  res.json({ ...out, ...analysts.forSymbol(sym) });
 });
 
 app.post("/analysts/scrape", async (req, res) => {

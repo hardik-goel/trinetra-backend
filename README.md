@@ -72,6 +72,62 @@ Two gotchas worth knowing up front:
   was verified: two stocks with identical passing fundamentals, differing only in
   `status`, so the gate was the single variable.
 
+## The original four
+The app was commissioned against four criteria, and they are pinned in the engine
+so the display can never drift from what actually runs. `GET /profiles` returns
+`originalFour` with each one's live state:
+
+| # | the original phrase | engine id | on a delayed feed |
+|---|---------------------|-----------|-------------------|
+| 1 | Fundamentally strong | `fund` | active |
+| 2 | Breakout | `brk` | active |
+| 3 | Volume shockers | `vol` | active |
+| 4 | Buyers and sellers count and percentage | `flow` | **awaiting live data (Kite)** |
+
+The fourth ships **present and disabled**, not absent — so it is visibly dormant
+rather than forgotten, and becomes a one-tap enable the day Kite is connected.
+Order-book depth is paid exchange data, so on a free delayed feed it has nothing
+to answer with. It is excluded from the lock denominator, which is why the header
+reads 3/3 and never 3/4 with an unreachable fourth. Disabled entries do not affect
+`matchesCanonical`, so pinning it does not make the drift banner fire.
+
+## Named experts
+`lib/analysts.js` captures calls from named experts — **Sandeep Jain** and **Anil
+Singhvi** — on stocks, alongside brokerage targets. They are sources like any
+other: logged when seen, resolved later against what price did, and reported with
+n. Below five resolved calls there is a count and no hit rate. Expert calls go
+stale after **45 days** rather than 90 — a read on the current tape ages faster
+than a twelve-month thesis.
+
+**Expert influence is capped at 10 points of the confidence score, combined**,
+against 28 for convergence of independent technical methods. The cap holds even
+when a source starts looking reliable, because the system must never become a
+channel for one person's opinion. It is stated in `confidence.caps` when it bites.
+
+Scraping zeebiz and the search fallback is best-effort and currently returns
+nothing — the same anti-bot problem as the brokerage pages. `POST /analysts/experts
+{symbol}` tries; `POST /analysts {symbol, broker, call, target, …}` is the path
+that works, and a hand-entered call is scored identically.
+
+## Direction-aware pricing
+Every signal, playbook row and alert carries `direction: "buy" | "sell"`, and the
+labels travel with the payload rather than being inferred:
+
+| | buy | sell |
+|---|-----|------|
+| action level | `Entry` | `Sell at` |
+| target | `Target`, **above** | `Buy back`, **below** |
+| potential | upside from entry | the **fall** to the buy-back level |
+
+A sell's move is reported as a positive magnitude with `downward: true`, so it can
+never be rendered as a negative gain — and never with upward language. Sorting on
+potential uses `magnitudePct`, so both directions rank by size.
+
+**Track Record reports the two separately, never merged.** A sell is correct when
+price *fell* to the target, so its returns are stored sign-inverted at the point
+of recording; `stats().byDirection` gives each its own win rate and n. A combined
+figure across two different kinds of bet is not a number about anything.
+
 ## The three criteria, and why the eye was not opening
 The instrument exists for three checks — **fundamentals, breakout, volume
 shocker** — and the eye opens when all three lock. They are defined once, in

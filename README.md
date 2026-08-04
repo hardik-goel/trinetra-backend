@@ -72,6 +72,54 @@ Two gotchas worth knowing up front:
   was verified: two stocks with identical passing fundamentals, differing only in
   `status`, so the gate was the single variable.
 
+## Loading the universe from NSE indices
+
+```
+GET  /universe/indices                      → what can be loaded
+POST /universe/indices {}                   → Nifty 50 + Next 50 + Midcap 100 + Smallcap 100
+POST /universe/indices { indices: ["nifty50"], replace: true }
+```
+
+Constituents are fetched **live from NSE's archive host** (`nsearchives.nseindia.com`),
+which serves CSVs without the bot-check that blocks the main site. Fetched rather
+than shipped as a snapshot: the indices rebalance quarterly, and a hardcoded list is
+wrong within a quarter while looking exactly as authoritative as a correct one.
+
+Each index becomes a **watchlist group**, so the dashboard can slice by it. The
+default set is 301 distinct symbols.
+
+**Additive by default. A symbol you added yourself is never removed by this** — the
+only thing that removes a symbol is you removing it. `replace: true` makes the named
+groups match the index exactly, and still leaves your other groups alone.
+
+### What 300 symbols costs
+
+The scan is serial against a free feed, roughly **0.5s per symbol**, so a full pass
+over 301 names takes about **3 minutes**:
+
+| universe | pass time | REFRESH_MS |
+|---|---|---|
+| ~25 | ~15s | 60000 (default) |
+| ~100 | ~60s | 90000 |
+| ~300 | ~180s | **190000** |
+
+**Set `REFRESH_MS=190000` for a 300-name universe.** Passes that overlap are skipped
+rather than queued — a queue of stale passes is worth nothing — and the skip is
+logged with the interval you should be using. On a ~15-minute delayed feed,
+refreshing faster than three minutes is false precision regardless.
+
+Two more things at this size:
+
+- **Fundamentals** are scraped in the background, paced one per second — about six
+  minutes for a full universe, once, then cached. Until a symbol is scraped its
+  fundamentals criteria read NO DATA, which cannot veto anything.
+- **The Intraday profile doubles the request count** (intraday bars are a second
+  request per symbol). At 300 names, disable it unless you specifically want it —
+  it is on a 15-minute delayed feed anyway.
+
+Measured on a 301-symbol run: all 301 resolved, no feed errors, 124 MB resident
+against Render free's 512 MB.
+
 ## Surviving a redeploy without paying for a disk
 
 Render's free plan has no persistent disk. Every redeploy wipes `data/`, and with

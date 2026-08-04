@@ -391,6 +391,35 @@ one: "Download backup" before a deploy, "Restore from file" after.
 var unset both return **503** rather than serving — they expose and can destroy
 the whole trading record, and CORS does not protect a non-browser caller.
 
+### `POST /universe/indices` · `GET /universe/indices`
+
+Loads NSE index constituents as watchlist groups, fetched live from the exchange.
+
+```json
+POST { "indices": ["nifty50","niftynext50","midcap100","smallcap100"], "replace": false }
+→ { "ok": true,
+    "groups": { "Default": 3, "Nifty 50": 50, "Nifty Next 50": 50,
+                "Midcap 100": 100, "Smallcap 100": 100 },
+    "symbols": 301, "addedThisCall": 298, "previousTotal": 3,
+    "errors": null,
+    "cap": { "max": 400, "reached": false },
+    "refresh": { "currentMs": 60000, "suggestedMs": 190000, "note": "…" },
+    "fundamentals": "…" }
+```
+
+Keys: `nifty50`, `niftynext50`, `nifty100`, `midcap100`, `smallcap100`.
+
+- **Additive by default** — symbols the user added are never dropped. `replace: true`
+  makes the named groups match the index exactly and leaves other groups alone.
+- `errors[]` is non-null when some indices failed. Render it: three of four lists
+  loading silently would leave the user believing their universe covers something
+  it does not.
+- **`refresh.note` is the one to surface.** A 300-symbol universe needs
+  `REFRESH_MS` around 190000; below that, passes overlap and get skipped, and prices
+  go quietly stale rather than visibly failing.
+
+---
+
 ### `GET /health` — `storage`, and `GET /storage` · `POST /storage/flush`
 
 Whether this instance's data survives a redeploy. Surfaced on `/health` because

@@ -54,6 +54,7 @@ import { trendIntact as trendOf } from "./lib/indicators.js";
 import { analyse as analyseCandlesFor } from "./lib/candles.js";
 import { candidates as levelCandidatesFor } from "./lib/levels.js";
 import { build as buildPlaybook } from "./lib/playbook.js";
+import { fetchIndices, INDICES } from "./lib/nseIndices.js";
 import * as remote from "./lib/remoteStore.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -67,7 +68,9 @@ const FUNDAMENTALS = read("fundamentals.json");
 // committed list when present; same ephemeral caveat as config.json — Render
 // free wipes it on redeploy and the UI re-pushes.
 const UNIVERSE_PATH = path.join(__dirname, "universe.runtime.json");
-const MAX_SYMBOLS = 200;
+/* Nifty 100 + Midcap 100 + Smallcap 100 is 300 distinct names before the user's
+   own picks. The cap exists to stop a paste-accident, not to limit the universe. */
+const MAX_SYMBOLS = 400;
 const SYMBOL_RE = /^[A-Z0-9&-]+$/; // NSE symbol charset
 const RAW_UNIVERSE = fs.existsSync(UNIVERSE_PATH) ? read("universe.runtime.json") : read("universe.json");
 
@@ -345,7 +348,26 @@ function volumePace(q) {
   };
 }
 
+/* A full pass is roughly half a second per symbol against the free feed, so a
+   300-name universe takes minutes — longer than the refresh interval. Without a
+   guard the passes stack, each one competing for the same rate limit and none of
+   them finishing. Skipped rather than queued: the next tick is seconds away, and
+   a queue of stale passes is worth nothing. */
+let refreshing = false;
+let skippedRefreshes = 0;
+
 async function refresh() {
+  if (refreshing) {
+    if (++skippedRefreshes % 10 === 1) {
+      console.warn(`[refresh] previous pass still running — skipped (${skippedRefreshes} so far). ${SYMBOLS.length} symbols at ~0.5s each needs REFRESH_MS above ${Math.ceil(SYMBOLS.length * 0.6 / 10) * 10_000}.`);
+    }
+    return;
+  }
+  refreshing = true;
+  try { return await refreshOnce(); } finally { refreshing = false; }
+}
+
+async function refreshOnce() {
   // reset the per-day dedupe at date rollover
   const today = new Date().toDateString();
   if (today !== lastDay) { firedToday.clear(); lastDay = today; }
@@ -988,6 +1010,71 @@ app.post("/universe/bulk-add", (req, res) => {
   if (added) { ensureFundamentals(SYMBOLS.filter(s => !had.has(s))); refresh(); }
   res.json({ ...universeResponse(), added, skipped: req.body.symbols.length - added });
 });
+
+/* Load NSE index constituents as watchlist groups.
+
+   Fetched live from the exchange archive rather than shipped as a snapshot: the
+   indices rebalance quarterly, and a hardcoded list is wrong within a quarter
+   while looking exactly as authoritative as a correct one.
+
+   ADDITIVE BY DEFAULT. Symbols you added yourself are never dropped by this —
+   they stay in whatever group they are in, and the only way one leaves is if you
+   remove it. Pass `replace: true` to make the named groups exactly match the
+   index instead, which still leaves your other groups alone. */
+app.post("/universe/indices", async (req, res) => {
+  const wanted = Array.isArray(req.body?.indices) && req.body.indices.length
+    ? req.body.indices.map(x => String(x).trim())
+    : ["nifty50", "niftynext50", "midcap100", "smallcap100"];
+  const unknown = wanted.filter(k => !INDICES[k]);
+  if (unknown.length) {
+    return res.status(400).json({ error: `unknown index: ${unknown.join(", ")}`, known: Object.keys(INDICES) });
+  }
+
+  const { groups, errors } = await fetchIndices(wanted);
+  if (!Object.keys(groups).length) {
+    return res.status(502).json({ error: "could not fetch any index from NSE", errors });
+  }
+
+  const before = unionGroups(GROUPS, cleanSymbols).length;
+  const replace = req.body?.replace === true;
+  const added = [];
+  for (const [group, symbols] of Object.entries(groups)) {
+    const existing = replace ? [] : (GROUPS[group] || []);
+    const merged = cleanSymbols([...existing, ...symbols]);
+    added.push(...merged.filter(x => !(GROUPS[group] || []).includes(x)));
+    GROUPS[group] = merged;
+  }
+  commitGroups(false);
+
+  const after = unionGroups(GROUPS, cleanSymbols).length;
+  const overCap = after >= MAX_SYMBOLS;
+  /* The scan is serial against a free feed, so the universe size sets the floor
+     on how often a full pass can complete. Stated in seconds the user can act on
+     rather than left to be discovered as silently stale prices. */
+  const suggestedRefreshMs = Math.ceil(after * 0.6 / 10) * 10_000;
+
+  res.json({
+    ok: true,
+    groups: Object.fromEntries(Object.entries(GROUPS).map(([g, v]) => [g, v.length])),
+    symbols: after, addedThisCall: [...new Set(added)].length, previousTotal: before,
+    errors: errors.length ? errors : null,
+    cap: { max: MAX_SYMBOLS, reached: overCap,
+           note: overCap ? `Capped at ${MAX_SYMBOLS}; symbols beyond that were dropped.` : null },
+    refresh: {
+      currentMs: REFRESH_MS,
+      suggestedMs: suggestedRefreshMs,
+      note: REFRESH_MS < suggestedRefreshMs
+        ? `A full pass over ${after} symbols takes about ${Math.round(after * 0.6)}s against the free feed. REFRESH_MS is ${REFRESH_MS / 1000}s, so passes will be skipped as overlapping. Set REFRESH_MS=${suggestedRefreshMs} — on a ~15-minute delayed feed, refreshing faster than that is false precision anyway.`
+        : "Refresh interval is comfortable for this universe size.",
+    },
+    fundamentals: `Fundamentals for new symbols are scraped in the background, paced one per second — about ${Math.ceil(after / 60)} minutes for a full universe, once, then cached. Until a symbol is scraped its fundamentals criteria read NO DATA and cannot veto anything.`,
+  });
+});
+
+app.get("/universe/indices", (_, res) => res.json({
+  available: Object.entries(INDICES).map(([key, v]) => ({ key, group: v.group, label: v.label })),
+  note: "POST { indices: [keys], replace?: false } to load them as watchlist groups.",
+}));
 
 app.post("/universe/bulk-remove", (req, res) => {
   if (!Array.isArray(req.body?.symbols)) return res.status(400).json({ error: "symbols must be an array" });

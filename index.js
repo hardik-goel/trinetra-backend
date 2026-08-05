@@ -945,13 +945,22 @@ app.get("/health", (_, res) =>
   res.json({ ok: true, provider: PROVIDER, lastRefresh: snapshot.at, symbols: snapshot.data.length,
              delayed: PROVIDER === "yahooDelayed",
              // Whether this instance's data survives a redeploy. Surfaced here
-             // because "ephemeral" is a thing to be told, not to discover.
-             storage: remote.status() }));
+             // because "ephemeral" is a thing to be told, not to discover — but
+             // without the repo name or raw API errors, which are not public.
+             storage: remote.publicStatus() }));
 
 /* Storage detail and a manual flush, for when the user wants to be certain
    something is safely off this instance before redeploying. */
-app.get("/storage", (_, res) => res.json({ ...remote.status(), tracked: remote.trackedFiles() }));
-app.post("/storage/flush", async (_, res) => {
+/* Full detail names the repo and echoes GitHub's errors, and the flush causes
+   writes to an external service — hammering it would burn the API rate limit and
+   push storage into `degraded`. Same gate as /backup: infrastructure control,
+   not app data. /health carries the public subset for the dashboard banner. */
+app.get("/storage", (req, res) => {
+  if (!guardBackup(req, res)) return;
+  res.json({ ...remote.status(), tracked: remote.trackedFiles() });
+});
+app.post("/storage/flush", async (req, res) => {
+  if (!guardBackup(req, res)) return;
   try { res.json({ ok: true, ...(await remote.flush("manual")), status: remote.status() }); }
   catch (e) { res.status(502).json({ ok: false, error: e.message }); }
 });

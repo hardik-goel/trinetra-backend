@@ -440,7 +440,15 @@ Render a banner on anything other than `"durable"`:
 - `"degraded"` — configured, but the last push failed. `pendingFiles` exists only
   on that instance's disk. `POST /storage/flush` retries and returns the new status.
 
-`GET /storage` is the same object plus `tracked[]`, the file list.
+`/health` carries the **public subset only** — mode, durable, detail, fix,
+`pendingCount`, `lastPushAt`. It deliberately omits the repo name and the raw
+GitHub error text.
+
+`GET /storage` and `POST /storage/flush` return full detail and require
+`X-Backup-Token`, the same gate as `/backup`: full detail names the repo and echoes
+API errors, and the flush writes to an external service, so an ungated one could
+burn the rate limit and push storage into `degraded`. Build the banner from
+`/health`; wire the retry button only if the dashboard already holds the token.
 
 ---
 

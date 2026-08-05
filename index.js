@@ -2062,8 +2062,20 @@ app.listen(PORT, async () => {
     }
   }
   const st = remote.status();
-  console.log(`[storage] ${st.mode} — ${st.detail}`);
+  /* Not "durable" yet. At this point only the configuration has been read; no
+     write has been attempted, and a token with read-but-not-write access looks
+     identical here. Claiming durability before proving it is how the failure
+     stayed invisible. */
+  console.log(st.mode === "ephemeral"
+    ? `[storage] ephemeral — ${st.detail}`
+    : `[storage] configured (${st.repo} @ ${st.branch}) — verifying with a real write…`);
   remote.installShutdownFlush();
+
+  /* Boot only tells you what was configured. The first write is what proves it
+     works, so the diagnosis is printed after one — otherwise a token with read
+     but no write access looks healthy at startup and fails silently later, which
+     is exactly what happened. */
+  setTimeout(() => { remote.flush("startup check").then(() => remote.logDiagnosis()).catch(() => remote.logDiagnosis()); }, 15_000);
 
   /* Before the first scan, not after it. The first pass over a 300-name universe
      takes minutes, and any short signal it produces needs to know whether the

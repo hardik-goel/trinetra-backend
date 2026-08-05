@@ -68,9 +68,12 @@ const FUNDAMENTALS = read("fundamentals.json");
 // committed list when present; same ephemeral caveat as config.json — Render
 // free wipes it on redeploy and the UI re-pushes.
 const UNIVERSE_PATH = path.join(__dirname, "universe.runtime.json");
-/* Nifty 100 + Midcap 100 + Smallcap 100 is 300 distinct names before the user's
-   own picks. The cap exists to stop a paste-accident, not to limit the universe. */
-const MAX_SYMBOLS = 400;
+/* The cap exists to stop a paste-accident, not to limit the universe. Set high
+   deliberately: the binding constraint at this scale is not the cap, it is how
+   long a serial pass over the free feed takes (~0.5s/symbol) and how much
+   candle history fits in Render free's 512 MB. Both are reported by
+   /universe/indices and /health rather than enforced as a hidden ceiling. */
+const MAX_SYMBOLS = 1000;
 const SYMBOL_RE = /^[A-Z0-9&-]+$/; // NSE symbol charset
 const RAW_UNIVERSE = fs.existsSync(UNIVERSE_PATH) ? read("universe.runtime.json") : read("universe.json");
 
@@ -121,7 +124,12 @@ function commitGroups(refreshNow = true) {
 const FUND_CACHE_PATH = path.join(__dirname, "fundamentals.cache.json");
 const FUND_FIELDS = METRIC_KEYS; // the catalog decides, not this file
 let fundCache = fs.existsSync(FUND_CACHE_PATH) ? read("fundamentals.cache.json") : {};
-const saveFundCache = () => { try { fs.writeFileSync(FUND_CACHE_PATH, JSON.stringify(fundCache, null, 2)); } catch {} };
+const saveFundCache = () => {
+  try {
+    fs.writeFileSync(FUND_CACHE_PATH, JSON.stringify(fundCache, null, 2));
+    remote.markDirty("fundamentals.cache.json");
+  } catch {}
+};
 
 // The engine reads this merged view: a scraped value wins, and the hand-entered
 // seed fills any field the scrape could not establish. Status always reports
@@ -1898,6 +1906,12 @@ app.listen(PORT, async () => {
         SYMBOLS = unionGroups(GROUPS, cleanSymbols);
         console.log(`[remote] universe adopted — ${SYMBOLS.length} symbols`);
       } catch (e) { console.warn(`[remote] universe adopt failed: ${e.message}`); }
+    }
+    if (boot.adopted.includes("fundamentals.cache.json")) {
+      try {
+        fundCache = read("fundamentals.cache.json");
+        console.log(`[remote] fundamentals cache adopted — ${Object.keys(fundCache).length} symbols, no re-scrape needed`);
+      } catch (e) { console.warn(`[remote] fundamentals adopt failed: ${e.message}`); }
     }
     if (boot.adopted.includes("config.json")) {
       try {

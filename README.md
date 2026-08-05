@@ -117,8 +117,32 @@ Two more things at this size:
   request per symbol). At 300 names, disable it unless you specifically want it —
   it is on a 15-minute delayed feed anyway.
 
-Measured on a 301-symbol run: all 301 resolved, no feed errors, 124 MB resident
-against Render free's 512 MB.
+- **`/snapshot` grows with the universe** — about 11 KB per symbol, so 300 names is
+  a ~3.2 MB response and 1000 would be ~10.5 MB. That is a real cost on a phone.
+  If the dashboard polls it, poll it slowly, or ask for a lean variant.
+
+Measured on a 303-symbol run: all resolved, no feed errors, 83–124 MB resident
+against Render free's 512 MB. `MAX_SYMBOLS` is 1000, but the binding constraints
+are pass time and payload size, not the cap.
+
+### Nothing is uploaded — everything is fetched
+
+There is no data file to prepare for the 300 stocks. Adding a symbol is adding a
+name to a list; every number behind it is fetched on demand:
+
+| what | from | when | kept where |
+|---|---|---|---|
+| price, OHLCV, 20/50-day highs | Yahoo chart API | every refresh pass | memory only — regenerable |
+| fundamentals (ROE, D/E, growth…) | screener.in | once per symbol, then on staleness | `fundamentals.cache.json` → **repo** |
+| results/dividend dates | scraped | every 6h | `data/events.json` → **repo** |
+| index membership | NSE archive CSVs | when you POST /universe/indices | `universe.runtime.json` → **repo** |
+| your signals, holdings, trades, analyst calls | the app / you | as they happen | `data/*.json` → **repo** |
+
+Candles are deliberately **not** kept — they are regenerable in one pass and would
+dwarf everything else. The fundamentals cache **is** kept, because re-scraping it is
+about a second per symbol against a host that rate-limits: six minutes for a 300-name
+universe on every redeploy, assuming it is not simply refused. Staleness is still
+enforced on read, so keeping it never serves stale numbers.
 
 ## Surviving a redeploy without paying for a disk
 

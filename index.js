@@ -55,6 +55,7 @@ import { analyse as analyseCandlesFor } from "./lib/candles.js";
 import { candidates as levelCandidatesFor } from "./lib/levels.js";
 import { build as buildPlaybook } from "./lib/playbook.js";
 import { fetchIndices, INDICES } from "./lib/nseIndices.js";
+import * as fno from "./lib/fno.js";
 import * as remote from "./lib/remoteStore.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -525,12 +526,12 @@ function scan() {
         // The criteria block in the alert needs the values that made each check
         // pass, not just the criterion names.
         criteriaDetail: ev.criteria,
-        /* Every existing criterion detects upward setups — a breakout above the
-           20-day high, volume expansion on strength, buyer-side flow. There is
-           no bearish screening, so nothing here can produce "sell". The field
-           exists because the SELL rendering path is built and waiting; it is not
-           inferred by inverting a bullish signal. */
-        direction: "buy",
+        /* Read from the profile, never inferred. The bullish profiles detect
+           upward setups and say "buy"; the `short` profile has its own bearish
+           criteria and says "sell". No signal is ever produced by inverting
+           another one — a stock failing a breakout test is not thereby breaking
+           down. */
+        direction: profile.direction === "sell" ? "sell" : "buy",
         entryPrice: pot?.triggerPrice ?? null,
         exitPrice: exits?.primary?.price ?? null,
         potentialLeftPct: exits?.primary?.pct ?? null,
@@ -542,6 +543,25 @@ function scan() {
         lagDisclosure: profile.horizon === "intraday" && age.delayed
           ? `Prices are ~${Math.round(age.lagSeconds / 60)} minutes delayed. This stock has already moved ${pot?.movedAlreadyPct >= 0 ? "+" : ""}${pot?.movedAlreadyPct ?? 0}% since the trigger level; the estimate below is what may remain, not the full move.`
           : null,
+        /* A short is not a buy with the sign flipped. Two facts travel with it,
+           and neither is optional: the loss has no ceiling, and on most stocks
+           the position cannot survive the closing bell. When the stock is not in
+           F&O the horizon is CLAMPED to intraday here rather than displayed as
+           swing — a "3–5 day short" on a cash-only stock is not a trade that can
+           be placed, and printing it would be inventing an instruction. */
+        ...(profile.direction === "sell" ? (() => {
+          const sh = fno.shortability(s.symbol);
+          const clamped = sh.known && !sh.fno;
+          return {
+            shortability: sh,
+            horizon: clamped ? "intraday" : profile.horizon,
+            horizonClamped: clamped ? {
+              from: profile.horizon, to: "intraday",
+              why: "not in the F&O segment — a cash-market short must be bought back before the close",
+            } : null,
+            riskNote: "Loss on a short is unbounded. The stop is the risk control, not a formality.",
+          };
+        })() : {}),
         eventWarning: event && event.daysAway <= 3
           ? `${event.type === "results" ? "Results" : event.type} due in ${event.daysAway} day${event.daysAway === 1 ? "" : "s"} — this signal carries binary event risk.`
           : null,
@@ -1566,6 +1586,8 @@ function playbookFor(symbol, profileId) {
   const pb = buildPlaybook(stock, {
     profile, dataAge: dataAge(), event: stock.nextEvent,
     triggerPrice: triggerFor(stock, profile),
+    // A short's levels are the mirror: sell into the level, cover below it.
+    direction: profile.direction === "sell" ? "sell" : "buy",
   });
   playbookCache.set(key, pb);
   return pb;
@@ -1927,6 +1949,14 @@ app.post("/fundamentals/backfill", (_, res) => {
   });
 });
 
+/* Can this stock be shorted, and for how long. Exposed on its own because the
+   answer decides whether a signal is actionable at all. */
+app.get("/shortability", (req, res) => {
+  const sym = String(req.query.symbol || "").trim().toUpperCase();
+  if (!sym) return res.status(400).json({ error: "symbol required" });
+  res.json({ symbol: sym, ...fno.shortability(sym), listLoadedAt: fno.loadedAt(), fnoStocks: fno.count() });
+});
+
 app.get("/fundamentals/coverage", (_, res) => {
   const missing = SYMBOLS.filter(s => !fundCache[s]);
   res.json({
@@ -2035,6 +2065,12 @@ app.listen(PORT, async () => {
   console.log(`[storage] ${st.mode} — ${st.detail}`);
   remote.installShutdownFlush();
 
+  /* Before the first scan, not after it. The first pass over a 300-name universe
+     takes minutes, and any short signal it produces needs to know whether the
+     stock can be held overnight — a signal that fires before this list lands
+     reports its horizon as unknown, which is the least useful moment for it. */
+  await fno.ensure().catch(() => {});
+
   const hol = gate.loadHolidays();
   gate.loadLedger();
   console.log(hol
@@ -2049,6 +2085,7 @@ app.listen(PORT, async () => {
   setInterval(refresh, REFRESH_MS);
   setInterval(briefTick, 60_000);
   setInterval(() => events.ensureEvents(SYMBOLS), 6 * 3_600_000);
+  setInterval(() => fno.ensure().catch(() => {}), 24 * 3_600_000);
 
   const active = enabledProfiles(config.profiles).map(([id, p]) => `${p.name}${p.horizon === "intraday" ? "*" : ""}`);
   console.log(`[profiles] ${active.join(", ")} (${active.length} enabled)`);

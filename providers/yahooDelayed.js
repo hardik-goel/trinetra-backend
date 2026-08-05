@@ -83,6 +83,11 @@ async function fetchOne(symbol, wantIntraday) {
     // high20 drives swing.
     high50: closes.length > 1 ? Math.max(...closes.slice(-51, -1)) : price,
     low20: closes.length > 1 ? Math.min(...closes.slice(-21, -1)) : price,
+    // Mirrors of high50/high52. A breakdown needs the same levels a breakout
+    // does, measured the same way — excluding today's bar, so a stock does not
+    // "break" a low it set itself an hour ago.
+    low50: closes.length > 1 ? Math.min(...closes.slice(-51, -1)) : price,
+    low52: Math.min(...closes.slice(-250), price),
     high52: Math.max(...closes.slice(-250), price),
     dayHigh: Number.isFinite(lastBar.h) ? lastBar.h : price,
     dayLow: Number.isFinite(lastBar.l) ? lastBar.l : price,

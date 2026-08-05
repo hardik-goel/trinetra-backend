@@ -750,6 +750,8 @@ function scanCycles(opts = {}) {
       try {
         const pb = buildPlaybook(withCtx, {
           profile: kind === "sell" ? sellP : buyP, dataAge: dataAge(), direction: dir,
+          // Trimming something owned — never a short. "Buy back" is correct here.
+          intent: "trim",
         });
         const t = pb.exits?.primary;
         if (!pb.entry?.zone || !t) return null;
@@ -971,6 +973,66 @@ app.get("/health", (_, res) =>
              // because "ephemeral" is a thing to be told, not to discover — but
              // without the repo name or raw API errors, which are not public.
              storage: remote.publicStatus() }));
+
+/* A real signal payload for a screener profile, before one has fired.
+
+   Same construction path as a live signal — evaluate the profile, build the
+   playbook, attach shortability — with only the LOCK bypassed. It is not a
+   signal: nothing alerts, nothing enters the track record, nothing is deduped.
+   Built because the sell preview caught a genuine risk-reward bug that the
+   documented shape would never have shown. */
+app.get("/signals/preview", (req, res) => {
+  const symbol = String(req.query.symbol || "").trim().toUpperCase();
+  const profileId = cleanId(req.query.profile || "short");
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+
+  const profile = config.profiles[profileId];
+  if (!profile) return res.status(404).json({ error: `no such profile: ${profileId}`, known: Object.keys(config.profiles) });
+
+  const stock = stockBySymbol()[symbol];
+  if (!stock) return res.status(404).json({ error: `${symbol} is not in the scanned universe` });
+
+  const ev = evaluate(stock, profile.criteria);
+  const isSell = profile.direction === "sell";
+  const pb = playbookFor(symbol, profileId);
+  const sh = isSell ? fno.shortability(symbol) : null;
+  const clamped = !!(sh?.known && !sh.fno);
+
+  res.json({
+    preview: true,
+    notASignal: "Built by the same path as a live signal with only the criteria lock bypassed. Prices, levels, labels and evidence are real; the fact that it fired is not. Never render this in the signal list.",
+    wouldFire: !!ev.locked,
+    lockState: { locked: !!ev.locked, passed: (ev.criteria || []).filter(c => c.pass).map(c => c.name),
+                 failed: (ev.criteria || []).filter(c => !c.pass && !c.skipped).map(c => c.name),
+                 skipped: (ev.criteria || []).filter(c => c.skipped).map(c => c.name) },
+    signal: {
+      symbol, name: stock.name, price: stock.price,
+      profileId, profileName: profile.name,
+      direction: isSell ? "sell" : "buy",
+      horizon: clamped ? "intraday" : profile.horizon,
+      criteriaDetail: ev.criteria,
+      notEvaluated: ev.notEvaluated, criteriaWarnings: ev.warnings,
+      entryPrice: pb?.entry?.zone?.high ?? null,
+      exitPrice: pb?.exits?.primary?.mid ?? null,
+      actionLabel: pb?.exits?.actionLabel ?? null,
+      targetLabel: pb?.exits?.targetLabel ?? null,
+      intent: pb?.exits?.intent ?? null,
+      riskReward: pb?.exits?.riskReward ?? null,
+      /* Surfaced beside the score, not buried. A short can lock every criterion
+         and still be a bad bet on geometry alone — and on a short the losing side
+         has no floor, so sub-1:1 matters more here than anywhere else. */
+      riskRewardWarning: pb?.exits?.riskRewardWarning ?? null,
+      confidence: pb?.exits?.confidence ? { score: pb.exits.confidence.score, band: pb.exits.confidence.band } : null,
+      ...(isSell ? {
+        shortability: sh,
+        horizonClamped: clamped ? { from: profile.horizon, to: "intraday",
+          why: "not in the F&O segment — a cash-market short must be bought back before the close" } : null,
+        riskNote: "Loss on a short is unbounded. The stop is the risk control, not a formality.",
+      } : {}),
+      dataAge: dataAge(),
+    },
+  });
+});
 
 /* Storage detail and a manual flush, for when the user wants to be certain
    something is safely off this instance before redeploying. */
@@ -1602,6 +1664,8 @@ app.get("/playbook", (req, res) => {
 
 app.get("/playbook/all", (req, res) => {
   const profileId = cleanId(req.query.profile || "swing");
+  const profile = config.profiles[profileId] || config.profiles.swing;
+  const isShortProfile = profile?.direction === "sell";
   const rows = [];
   for (const s of snapshot.data) {
     const pb = playbookFor(s.symbol, profileId);
@@ -1621,6 +1685,19 @@ app.get("/playbook/all", (req, res) => {
        carries the profiles this stock actually satisfies right now, which is the
        honest basis for a timeframe. A row locked under nothing has no timeframe
        of its own and should not be shown as though it does. */
+    const shortInfo = isShortProfile ? (() => {
+      const sh = fno.shortability(s.symbol);
+      const clamped = sh.known && !sh.fno;
+      return {
+        shortability: sh,
+        horizonClamped: clamped ? {
+          from: profile.horizon, to: "intraday",
+          why: "not in the F&O segment — a cash-market short must be bought back before the close",
+        } : null,
+        riskNote: "Loss on a short is unbounded. The stop is the risk control, not a formality.",
+      };
+    })() : null;
+
     const locked = Object.entries(s.profileResults || {})
       .filter(([, r]) => r?.locked)
       .map(([id]) => ({ id, horizon: config.profiles[id]?.horizon || null }));
@@ -1631,7 +1708,15 @@ app.get("/playbook/all", (req, res) => {
       direction: pb.direction || "buy",
       actionLabel: pb.exits?.actionLabel || "Entry",
       targetLabel: pb.exits?.targetLabel || "Target",
-      profileId, horizon: pb.horizon,
+      intent: pb.exits?.intent || "entry",
+      /* Whether a short can be held, on the row itself. Without this a caller
+         needs one extra request per short — 300 of them on this universe — to
+         answer a question the row already knows, and the horizon printed beside
+         it may be one the market will not honour. */
+      ...(shortInfo || {}),
+      profileId,
+      // Clamped on the row too, so the horizon shown is one the market allows.
+      horizon: shortInfo?.horizonClamped ? "intraday" : pb.horizon,
       lockedUnder: locked,
       entry: { kind: pb.entry.kind, zone: pb.entry.zone, triggered: pb.entry.triggered,
                chasing: pb.entry.chasing, warning: pb.entry.warning,

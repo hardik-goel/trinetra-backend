@@ -713,7 +713,44 @@ carried overnight, in whole lots, through futures or options.
 | `fno: true` | `lotSize` is the position increment. Size is set by the lot, not the risk budget — render it beside any sizing suggestion. |
 | `known: false` | the F&O list could not be fetched. Show "unknown", never "cash only". |
 
-`GET /shortability?symbol=` answers the same question directly.
+`GET /shortability?symbol=` answers the same question directly, and
+**`/playbook/all?profile=short` rows carry `shortability`, `horizonClamped` and
+`riskNote` inline** — no per-symbol round trip.
+
+**Three vocabularies, because there are three different trades.** `intent` says
+which, and the labels follow it:
+
+| `intent` | `actionLabel` / `targetLabel` | what it is |
+|---|---|---|
+| `entry` | Entry / Target | buying something you do not own |
+| `trim` | Sell at / Buy back | selling part of a **holding**, then restoring it |
+| `short` | Short at / Cover at | selling borrowed stock, then covering |
+
+"Buy back" on a short is wrong — it implies restoring a position you hold, which is
+the cycle feature, not a short. Render the labels from the payload and the three
+stay distinct.
+
+### `GET /signals/preview?symbol=&profile=short`
+
+A real signal payload before one has fired. Same construction path as a live
+signal — evaluate, build the playbook, attach shortability — with only the **lock**
+bypassed. Nothing alerts, nothing enters the track record.
+
+```json
+{ "preview": true, "notASignal": "…", "wouldFire": true,
+  "lockState": { "locked": true, "passed": ["Breakdown","Distribution","Trend broken"],
+                 "failed": [], "skipped": [] },
+  "signal": { "direction": "sell", "actionLabel": "Short at", "targetLabel": "Cover at",
+              "intent": "short", "entryPrice": 2921.55, "exitPrice": 2805.19,
+              "riskReward": { "toPrimary": 0.21 },
+              "riskRewardWarning": "Risk-reward to the primary target is below 1:1 …",
+              "shortability": { … }, "riskNote": "…" } }
+```
+
+**`riskRewardWarning` is not decoration.** The first real short preview locked all
+three criteria at R:R 0.21 — roughly five rupees of risk per rupee of reward. A
+signal can be entirely valid and still be a bad bet on geometry, and on a short the
+losing side has no floor. Render it next to the confidence score, not below the fold.
 
 The criteria are bearish in their own right — breakdown below the 20-day low on a
 down day well off the 52-week high, distribution volume, price below the 50-day

@@ -157,7 +157,10 @@ Set two environment variables:
 | `DATA_REPO` | `owner/name` of a **private** repo, e.g. `hardik-goel/trinetra-data` |
 | `DATA_REPO_TOKEN` | fine-grained PAT, **Contents: read and write**, scoped to that repo only |
 
-Optional: `DATA_BRANCH` (default `main`), `DATA_FLUSH_MS` (default 10000).
+Optional: `DATA_BRANCH` (default: **whatever the repo's default branch actually
+is**, read from the API — this project's own repos use `master`, and writing to a
+branch that does not exist fails every call with a 404 that reads like a
+permissions problem), `DATA_FLUSH_MS` (default 10000).
 
 The repo must exist and have at least one commit — create it with a README and
 nothing else. Do not reuse the pravesh PAT: that one is scoped to `pravesh-engine`

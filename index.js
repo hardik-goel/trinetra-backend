@@ -1931,7 +1931,13 @@ app.get("/fundamentals/coverage", (_, res) => {
   const missing = SYMBOLS.filter(s => !fundCache[s]);
   res.json({
     universe: SYMBOLS.length, cached: SYMBOLS.length - missing.length,
-    missing: missing.length, missingSymbols: missing.slice(0, 50),
+    missing: missing.length,
+    /* The whole list, never a slice. A truncated array sitting next to a complete
+       count is the shape that makes a caller confidently wrong — it reads as the
+       answer and is a sample. The universe is capped at 1000 symbols, so the
+       worst case is a few kilobytes of strings; there is nothing here worth
+       trading correctness for. */
+    missingSymbols: missing,
     pct: SYMBOLS.length ? Math.round(((SYMBOLS.length - missing.length) / SYMBOLS.length) * 100) : 0,
   });
 });

@@ -1052,7 +1052,8 @@ app.post("/universe/indices", async (req, res) => {
     return res.status(502).json({ error: "could not fetch any index from NSE", errors });
   }
 
-  const before = unionGroups(GROUPS, cleanSymbols).length;
+  const had = new Set(unionGroups(GROUPS, cleanSymbols));
+  const before = had.size;
   const replace = req.body?.replace === true;
   const added = [];
   for (const [group, symbols] of Object.entries(groups)) {
@@ -1062,6 +1063,16 @@ app.post("/universe/indices", async (req, res) => {
     GROUPS[group] = merged;
   }
   commitGroups(false);
+
+  /* Every other path that adds a symbol queues its fundamentals; this one did
+     not, so loading 300 names left 280 of them with no fundamentals at all. They
+     are not merely missing — a criterion with no data cannot veto, so those
+     stocks were locking on breakout and volume alone while the header still said
+     three criteria. Silent, and exactly the kind of quiet weakening this engine
+     is built to refuse. */
+  const fresh = unionGroups(GROUPS, cleanSymbols).filter(x => !had.has(x));
+  if (fresh.length) ensureFundamentals(fresh);
+  refresh();
 
   const after = unionGroups(GROUPS, cleanSymbols).length;
   const overCap = after >= MAX_SYMBOLS;
@@ -1084,7 +1095,15 @@ app.post("/universe/indices", async (req, res) => {
         ? `A full pass over ${after} symbols takes about ${Math.round(after * 0.6)}s against the free feed. REFRESH_MS is ${REFRESH_MS / 1000}s, so passes will be skipped as overlapping. Set REFRESH_MS=${suggestedRefreshMs} — on a ~15-minute delayed feed, refreshing faster than that is false precision anyway.`
         : "Refresh interval is comfortable for this universe size.",
     },
-    fundamentals: `Fundamentals for new symbols are scraped in the background, paced one per second — about ${Math.ceil(after / 60)} minutes for a full universe, once, then cached. Until a symbol is scraped its fundamentals criteria read NO DATA and cannot veto anything.`,
+    fundamentals: {
+      queued: fresh.length,
+      etaMinutes: Math.ceil(fresh.length / 60),
+      note: `${fresh.length} symbol(s) queued for fundamentals, paced one per second — roughly ${Math.ceil(fresh.length / 60)} minute(s), then cached permanently.`,
+      /* Stated plainly because it changes what a signal MEANS in the meantime. */
+      warning: fresh.length
+        ? "Until a symbol is scraped, its fundamentals criterion has no data. A criterion with no data cannot veto, so those stocks can lock on breakout and volume alone. Signals fired in this window are weaker than they look — check `notEvaluated` on each one."
+        : null,
+    },
   });
 });
 
@@ -1844,6 +1863,36 @@ function briefTick() {
 }
 
 app.get("/fundamentals", (_, res) => res.json(fundCache));
+
+/* Queue fundamentals for every scanned symbol that has none.
+
+   Needed because a universe can grow by a path that forgot to queue them, and
+   because the coverage number is worth being able to ask for directly: a stock
+   with no fundamentals still produces signals, they are just weaker than the
+   header implies. */
+app.post("/fundamentals/backfill", (_, res) => {
+  const missing = SYMBOLS.filter(s => !fundCache[s]);
+  if (missing.length) ensureFundamentals(missing);
+  res.json({
+    ok: true,
+    universe: SYMBOLS.length,
+    cached: SYMBOLS.length - missing.length,
+    queued: missing.length,
+    etaMinutes: Math.ceil(missing.length / 60),
+    note: missing.length
+      ? `${missing.length} symbol(s) queued, paced one per second. Until each is scraped its fundamentals criterion has no data, and a criterion with no data cannot veto — so those stocks can lock on the remaining criteria alone.`
+      : "Every scanned symbol already has fundamentals.",
+  });
+});
+
+app.get("/fundamentals/coverage", (_, res) => {
+  const missing = SYMBOLS.filter(s => !fundCache[s]);
+  res.json({
+    universe: SYMBOLS.length, cached: SYMBOLS.length - missing.length,
+    missing: missing.length, missingSymbols: missing.slice(0, 50),
+    pct: SYMBOLS.length ? Math.round(((SYMBOLS.length - missing.length) / SYMBOLS.length) * 100) : 0,
+  });
+});
 
 app.post("/fundamentals/refresh", async (req, res) => {
   const [symbol] = cleanSymbols([req.body?.symbol]);

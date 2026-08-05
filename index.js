@@ -589,6 +589,9 @@ function scan() {
   deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tally, now });
   scanExits(windowOpen);
   scanCycles();
+  // Built ahead of the click: the panel opens instantly instead of computing 303
+  // playbooks while the user waits.
+  warmPlaybooks();
 }
 
 /* Everything between "a signal happened" and "the user's phone buzzes".
@@ -1529,14 +1532,37 @@ app.get("/decision", (req, res) => {
    cheap parts move with price and are recomputed on every request. */
 const playbookCache = new Map();
 
+let playbookCacheAt = null;
+
+/* Built ahead of the request rather than on it. 303 playbooks is a few seconds of
+   work; doing it while the user waits is the difference between a panel that opens
+   and one that hangs. Chunked so the event loop keeps serving during the build. */
+function warmPlaybooks(profileId = "swing") {
+  const symbols = snapshot.data.map(s => s.symbol);
+  let i = 0;
+  const at = snapshot.at;
+  const step = () => {
+    if (at !== snapshot.at) return;          // a newer snapshot landed; that pass wins
+    const end = Math.min(i + 25, symbols.length);
+    for (; i < end; i++) { try { playbookFor(symbols[i], profileId); } catch {} }
+    if (i < symbols.length) setTimeout(step, 0);
+  };
+  setTimeout(step, 0);
+}
+
 function playbookFor(symbol, profileId) {
   const stock = stockBySymbol()[symbol];
   if (!stock) return null;
   const profile = config.profiles[profileId] || config.profiles.swing;
   if (!profile) return null;
-  const key = `${symbol}:${profile.horizon}:${gate.tradingDay()}:${Math.round(stock.price)}`;
+  /* Keyed on the snapshot, not on a rounded price. Keying on price meant any ₹1
+     move invalidated the entry, so with 303 symbols the cache missed constantly
+     and the 400-entry ceiling cleared the whole thing every pass — which is why
+     /playbook/all took nine seconds. A playbook is a function of the snapshot;
+     it cannot change until the snapshot does. */
+  const key = `${symbol}:${profileId}`;
+  if (playbookCacheAt !== snapshot.at) { playbookCache.clear(); playbookCacheAt = snapshot.at; }
   if (playbookCache.has(key)) return playbookCache.get(key);
-  if (playbookCache.size > 400) playbookCache.clear();
   const pb = buildPlaybook(stock, {
     profile, dataAge: dataAge(), event: stock.nextEvent,
     triggerPrice: triggerFor(stock, profile),
@@ -1567,8 +1593,24 @@ app.get("/playbook/all", (req, res) => {
        payload nested them under `exits` — the same concepts at two different
        paths in one feature, which is a trap for anything binding both. A caller
        reading the nested shape got an em dash from a row that had the numbers. */
+    /* The timeframe shown against a row is a property of the PROFILE the caller
+       asked for, not of the stock — every row saying "3–5 days" is what asking
+       for `swing` means. So the profile is stated per row, and `lockedUnder`
+       carries the profiles this stock actually satisfies right now, which is the
+       honest basis for a timeframe. A row locked under nothing has no timeframe
+       of its own and should not be shown as though it does. */
+    const locked = Object.entries(s.profileResults || {})
+      .filter(([, r]) => r?.locked)
+      .map(([id]) => ({ id, horizon: config.profiles[id]?.horizon || null }));
     rows.push({
       symbol: pb.symbol, price: pb.price,
+      // Stated, never inferred. Every existing criterion detects upward setups,
+      // so this reads "buy" until bearish screening exists.
+      direction: pb.direction || "buy",
+      actionLabel: pb.exits?.actionLabel || "Entry",
+      targetLabel: pb.exits?.targetLabel || "Target",
+      profileId, horizon: pb.horizon,
+      lockedUnder: locked,
       entry: { kind: pb.entry.kind, zone: pb.entry.zone, triggered: pb.entry.triggered,
                chasing: pb.entry.chasing, warning: pb.entry.warning,
                convergence: pb.entry.convergence, families: pb.entry.families,

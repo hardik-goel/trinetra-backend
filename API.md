@@ -759,7 +759,40 @@ Kept out of `/exit-signals`, whose `signals[]` already means "a rule fired, cons
 exiting fully". `criteria[]` includes failed and skipped entries — three of four is
 not four of four.
 
-### `GET /cycle-signals/preview?symbol=&kind=sell|buyBack`
+### `/playbook/all` rows — direction, labels and the honest timeframe
+
+Rows now carry what a renderer needs instead of leaving it to be inferred:
+
+```json
+{ "symbol": "POLYCAB", "direction": "buy",
+  "actionLabel": "Entry", "targetLabel": "Target",
+  "profileId": "swing", "horizon": "swing",
+  "lockedUnder": [ { "id": "longterm", "horizon": "longterm" } ], … }
+```
+
+- **Use `actionLabel` / `targetLabel` as the column headers, per row.** A combined
+  "ENTRY / SELL AT" header is wrong on every row — each row is one direction and
+  says which. Until bearish screening exists every row is `"buy"`, so the header
+  should read **Entry** and **Target**, not both spellings at once.
+- **`horizon` is a property of `profileId`, not of the stock.** Asking for `swing`
+  is what makes every row say 3–5 days. That is the question being answered, not a
+  fact about the stock.
+- **`lockedUnder` is the honest timeframe.** It lists the profiles the stock
+  actually satisfies right now, with each one's horizon. A row locked under nothing
+  has no timeframe of its own — show a dash, not a borrowed one. In a live sample,
+  22 of 303 rows were locked, all under `longterm`, while every row displayed
+  "3–5 days" because the request asked for swing.
+
+Pass `?profile=positional` etc. to ask a different question.
+
+**Speed**: playbooks are cached per snapshot and built ahead of the request. The
+cache was previously keyed on rounded price, so a ₹1 move invalidated it and the
+400-entry ceiling cleared everything each pass — `/playbook/all` took 9.2s for 303
+symbols. It now serves in ~35ms.
+
+---
+
+
 
 A real SELL payload on demand, for wiring the sell rendering before a sell has ever
 fired. Built by the **same code path** as a live signal with only the criteria lock

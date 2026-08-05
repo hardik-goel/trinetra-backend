@@ -684,6 +684,48 @@ schema — feature-detect on `schemaVersion >= 2`, never `=== 2`.
 
 ---
 
+### Shorting — the `short` profile
+
+A SELL on a stock the user does not own. **Ships disabled**; enable with
+`PATCH /profiles/short { "enabled": true }`.
+
+Its signals carry `direction: "sell"` and three extra fields:
+
+```json
+{ "symbol": "MCX", "direction": "sell", "horizon": "swing",
+  "entryPrice": 2892.6, "exitPrice": 2696.91,
+  "shortability": { "known": true, "fno": true, "lotSize": 225,
+                    "overnight": true, "maxHorizon": null, "note": "…" },
+  "horizonClamped": null,
+  "riskNote": "Loss on a short is unbounded. The stop is the risk control, not a formality." }
+```
+
+**Render `riskNote` on every short, always.** A long can go to zero; a short has no
+ceiling.
+
+**`shortability` decides whether the signal is actionable at all.** In the Indian
+cash market a short must be closed the same session — only F&O stocks can be
+carried overnight, in whole lots, through futures or options.
+
+| field | meaning for the UI |
+|---|---|
+| `fno: false` | horizon is **clamped to intraday by the server**; `horizonClamped` says why. Never show the profile's horizon — a "3–5 day short" on a cash-only stock cannot be placed. |
+| `fno: true` | `lotSize` is the position increment. Size is set by the lot, not the risk budget — render it beside any sizing suggestion. |
+| `known: false` | the F&O list could not be fetched. Show "unknown", never "cash only". |
+
+`GET /shortability?symbol=` answers the same question directly.
+
+The criteria are bearish in their own right — breakdown below the 20-day low on a
+down day well off the 52-week high, distribution volume, price below the 50-day
+average. **Nothing is produced by inverting a bullish signal:** a stock failing a
+breakout test is not thereby breaking down.
+
+Live sample over 303 stocks: 112 passed "trend broken", 15 "distribution", 2
+"breakdown", and **1 locked all three**. Playbook levels mirror automatically —
+sell into the level, cover below it.
+
+---
+
 ### Direction-aware pricing
 
 `direction: "buy" | "sell"` is on every playbook, signal, cycle signal and history

@@ -608,6 +608,15 @@ function scan() {
          claim from one measured against this stock's own past behaviour, and the
          two must not be silently interchangeable. */
       let levels = exits, levelSource = exits ? "analogs" : null, pbFallback = null;
+      /* The stop falls back independently of the target. The analog path can
+         produce a target and no stop, and an alert that names a target with no
+         invalidation level is the half of the trade that loses money — the same
+         reason the stop is in the alert at all. */
+      if (levels?.primary?.price && !levels?.stop?.price) {
+        pbFallback = playbookFor(s.symbol, id);
+        const st = pbFallback?.exits?.stop;
+        if (st?.mid) levels = { ...levels, stop: { price: st.mid, pct: st.pct } };
+      }
       if (!levels?.primary?.price) {
         pbFallback = playbookFor(s.symbol, id);
         const prim = pbFallback?.exits?.primary;

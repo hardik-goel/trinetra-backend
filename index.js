@@ -1057,7 +1057,13 @@ app.get("/signals/preview", (req, res) => {
   const stock = stockBySymbol()[symbol];
   if (!stock) return res.status(404).json({ error: `${symbol} is not in the scanned universe` });
 
-  const ev = evaluate(stock, profile.criteria, { requireAll: !!profile.requireAll });
+  /* `requireAll` can be forced for a preview so the withheld path can be seen
+     against real market data without changing the live config. A renderer
+     verified only against a hand-written stub is not verified — the risk-reward
+     mirror passed a stub and failed on the real payload. */
+  const forceRequireAll = req.query.requireAll === "true" ? true
+    : req.query.requireAll === "false" ? false : !!profile.requireAll;
+  const ev = evaluate(stock, profile.criteria, { requireAll: forceRequireAll });
   const isSell = profile.direction === "sell";
   const pb = playbookFor(symbol, profileId);
   const sh = isSell ? fno.shortability(symbol) : null;
@@ -1067,9 +1073,14 @@ app.get("/signals/preview", (req, res) => {
     preview: true,
     notASignal: "Built by the same path as a live signal with only the criteria lock bypassed. Prices, levels, labels and evidence are real; the fact that it fired is not. Never render this in the signal list.",
     wouldFire: !!ev.locked,
-    lockState: { locked: !!ev.locked, passed: (ev.criteria || []).filter(c => c.pass).map(c => c.name),
+    lockState: { locked: !!ev.locked,
+                 lockQuality: ev.lockQuality,
+                 requireAll: forceRequireAll,
+                 withheldForMissingData: !!ev.withheldForMissingData,
+                 passed: (ev.criteria || []).filter(c => c.pass).map(c => c.name),
                  failed: (ev.criteria || []).filter(c => !c.pass && !c.skipped).map(c => c.name),
-                 skipped: (ev.criteria || []).filter(c => c.skipped).map(c => c.name) },
+                 skipped: (ev.criteria || []).filter(c => c.skipped).map(c => c.name),
+                 warnings: ev.warnings || [] },
     signal: {
       symbol, name: stock.name, price: stock.price,
       profileId, profileName: profile.name,

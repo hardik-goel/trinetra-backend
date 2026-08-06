@@ -304,6 +304,33 @@ function mergeTelegram(cur = {}, next = {}) {
   return { on, token, chatId };
 }
 
+/* The last completed scan, kept across restarts.
+
+   Render free sleeps the instance after ~15 minutes idle. On wake, a 300-name
+   pass takes minutes, and until it finishes the app has nothing to show — so the
+   user opens their screener and sees an empty watchlist and an empty playbook,
+   which reads as "no stock qualifies" when it means "the scan has not run".
+
+   Serving the previous scan closes that gap. It is STALE and says so: prices are
+   from the last pass, not from now, and `dataAge` already carries the age. Kept
+   outside data/ deliberately — it is regenerable in one pass, it is megabytes,
+   and committing it to the durable store on every refresh would be pure churn. */
+const SNAPSHOT_CACHE = path.join(__dirname, "snapshot.cache.json");
+const saveSnapshotCache = () => {
+  try {
+    fs.writeFileSync(SNAPSHOT_CACHE, JSON.stringify({
+      at: snapshot.at,
+      data: snapshot.data.map(({ candles, intradayBars, ...rest }) => rest),
+    }));
+  } catch {}
+};
+const loadSnapshotCache = () => {
+  try {
+    const j = JSON.parse(fs.readFileSync(SNAPSHOT_CACHE, "utf8"));
+    return Array.isArray(j?.data) && j.data.length ? j : null;
+  } catch { return null; }
+};
+
 let snapshot = { at: 0, data: [] };
 let signalLog = [];
 
@@ -364,6 +391,13 @@ function volumePace(q) {
    a queue of stale passes is worth nothing. */
 let refreshing = false;
 let skippedRefreshes = 0;
+/* An empty snapshot has two causes and they mean opposite things: nothing matched,
+   or nothing has been looked at yet. On Render's free plan the instance sleeps
+   after ~15 minutes idle and a 300-name pass takes minutes on wake, so a user who
+   opens the app cold sees an empty screen for the whole first pass — which reads
+   as "the screener found nothing" when it means "the screener has not run". */
+let scanProgress = { warming: true, done: 0, total: 0, startedAt: null };
+let snapshotRestored = false;
 
 async function refresh() {
   if (refreshing) {
@@ -373,7 +407,13 @@ async function refresh() {
     return;
   }
   refreshing = true;
-  try { return await refreshOnce(); } finally { refreshing = false; }
+  scanProgress = { ...scanProgress, done: 0, total: SYMBOLS.length, startedAt: Date.now() };
+  try { return await refreshOnce(); }
+  finally {
+    refreshing = false;
+    scanProgress = { ...scanProgress, warming: snapshot.data.length === 0 };
+    if (snapshot.data.length) { snapshotRestored = false; saveSnapshotCache(); }
+  }
 }
 
 async function refreshOnce() {
@@ -473,6 +513,31 @@ function analyse(stock, profile, ev) {
    the entry zone for a structural setup, spot otherwise. */
 function entryBasis(pot, pb, stock) {
   return pot?.triggerPrice ?? pb?.entry?.zone?.high ?? stock?.price ?? null;
+}
+
+/* What the screener is doing right now, in a shape a UI can branch on. */
+function scanState() {
+  const warming = snapshot.data.length === 0;
+  return {
+    warming,
+    scanning: refreshing,
+    symbols: snapshot.data.length,
+    universe: SYMBOLS.length,
+    lastCompletedAt: snapshot.at || null,
+    /* True while the rows being served come from the previous run rather than a
+       pass completed by this instance. The prices are real but old. */
+    restoredFromCache: snapshotRestored && refreshing,
+    etaSeconds: warming && refreshing && scanProgress.startedAt
+      ? Math.max(0, Math.round(SYMBOLS.length * 0.6 - (Date.now() - scanProgress.startedAt) / 1000))
+      : null,
+    message: snapshotRestored && refreshing
+      ? `Showing the last completed scan while a fresh one runs. Prices are from ${snapshot.at ? new Date(snapshot.at).toISOString() : "the previous pass"}, not from now.`
+      : warming
+      ? (refreshing
+          ? `First scan of ${SYMBOLS.length} symbols is running — this takes a few minutes after the service wakes. Nothing has been evaluated yet, so an empty list here does not mean nothing matched.`
+          : "No scan has completed yet. The service may be starting up.")
+      : null,
+  };
 }
 
 function scan() {
@@ -1049,6 +1114,7 @@ app.get("/health", (_, res) =>
              // Whether this instance's data survives a redeploy. Surfaced here
              // because "ephemeral" is a thing to be told, not to discover — but
              // without the repo name or raw API errors, which are not public.
+             scan: scanState(),
              storage: remote.publicStatus() }));
 
 /* A real signal payload for a screener profile, before one has fired.
@@ -1142,6 +1208,10 @@ app.get("/snapshot", (_, res) =>
   res.json({
     asOf: snapshot.at, provider: PROVIDER, delayed: FEED_DELAYED,
     dataAge: dataAge(),
+    /* Render this instead of an empty state. "Nothing matched" and "nothing has
+       been scanned yet" are different facts and only one of them is about the
+       market. */
+    scan: scanState(),
     // The candle series is for server-side analysis only; shipping 250 bars per
     // symbol to the browser every few seconds would be pure weight.
     data: snapshot.data.map(({ candles, intradayBars, ...rest }) => rest),
@@ -2318,6 +2388,16 @@ app.listen(PORT, async () => {
      a wipe into a non-event. Only absent files are adopted — a local file always
      wins, because replacing a live trade log with an older snapshot is a worse
      failure than a stale remote. */
+  /* Before anything else: put the last scan back, so the app has something to
+     show while the first live pass runs. Marked stale rather than presented as
+     current — `restoredFromCache` on /snapshot's scan block says so. */
+  const cached = loadSnapshotCache();
+  if (cached) {
+    snapshot = { at: cached.at, data: cached.data };
+    snapshotRestored = true;
+    console.log(`[snapshot] restored ${cached.data.length} symbols from the last scan (${new Date(cached.at).toISOString()}) — serving stale until the first live pass completes`);
+  }
+
   const boot = await remote.bootstrap().catch(e => ({ enabled: false, adopted: [], reason: e.message }));
   if (boot.adopted?.length) {
     // Re-read: the modules loaded their files at import time, before the pull.

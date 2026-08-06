@@ -763,6 +763,30 @@ caller reading one shape against the other finds null and assumes it is absent.
 
 ---
 
+### `scan` — on `/snapshot` and `/health`
+
+```json
+"scan": { "warming": false, "scanning": true, "symbols": 303, "universe": 303,
+          "lastCompletedAt": 1786…, "restoredFromCache": true,
+          "etaSeconds": null,
+          "message": "Showing the last completed scan while a fresh one runs. …" }
+```
+
+**An empty list has two causes and only one is about the market.** On Render's free
+plan the instance sleeps after ~15 minutes idle, and a 300-name pass takes minutes
+on wake — so a user opening the app cold previously saw an empty watchlist and an
+empty playbook, which reads as "nothing qualifies" when it means "nothing has been
+looked at".
+
+- `warming: true` — no scan has completed. **Render `message`, never an empty
+  state.** `etaSeconds` is a rough countdown.
+- `restoredFromCache: true` — the rows are the previous scan, served immediately on
+  a cold start while a fresh pass runs behind them. Prices are real but old;
+  `dataAge` and `lastCompletedAt` carry the age. Show a "last scan" marker.
+- Both false — the rows are current.
+
+---
+
 ### `GET /stock?symbol=` — everything about one symbol
 
 One call that answers "why is this stock here and not there". Built because that

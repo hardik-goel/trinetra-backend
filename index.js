@@ -466,12 +466,32 @@ function applyForecasts(forecasts) {
 
 /* The trigger level a setup qualified at — what "already moved" is measured
    against. Without it, movedAlready would be measured from an arbitrary point. */
-function triggerFor(stock, profile) {
-  switch (profile.horizon) {
-    case "intraday": return stock.intraday?.orHigh ?? stock.dayOpen ?? stock.prevClose;
-    case "positional": return stock.high50 ?? stock.high20;
-    default: return stock.high20;
-  }
+const BREAKOUT_METRICS = new Set(["aboveHigh20", "aboveHigh50", "orBreakout"]);
+
+/* Did the setup actually clear its breakout level, or did it lock on the other
+   criteria while the level sits untouched overhead? The distinction decides
+   whether that level is an entry or a bystander. */
+function breakoutConfirmed(ev) {
+  return (ev?.criteria || []).some(r =>
+    r.pass && (r.checksOut || r.checks || []).some(ch => BREAKOUT_METRICS.has(ch.metric)));
+}
+
+/* The price the trade starts at.
+   A breakout level is a TRIGGER only while the setup is waiting on it. These
+   profiles do not require the breakout to pass — requireAll is off by default —
+   so a stock could lock on fundamentals and volume alone and still be handed its
+   20-day high as an entry. BEL fired at ₹399.10 and the alert said "Entry
+   ₹431.50": 8% above the price at that moment, on a thesis that never mentioned
+   the level. That is not an order anyone could place. When the breakout has not
+   been confirmed the trade starts where it actually starts — at spot. */
+function triggerFor(stock, profile, ev) {
+  const level = profile.horizon === "intraday"
+    ? (stock.intraday?.orHigh ?? stock.dayOpen ?? stock.prevClose)
+    : profile.horizon === "positional" ? (stock.high50 ?? stock.high20)
+    : stock.high20;
+  if (!Number.isFinite(level) || !Number.isFinite(stock.price)) return level ?? stock.price ?? null;
+  if (level > stock.price && !breakoutConfirmed(ev)) return stock.price;
+  return level;
 }
 
 /* Sortable summary: the four numbers a watchlist column needs, and nothing
@@ -503,9 +523,16 @@ function decisionSummary(stock, profile, result) {
 
 /** Everything A8 produces for one stock under one profile. */
 function analyse(stock, profile, ev) {
-  const pot = potential(stock, { horizon: profile.horizon, triggerPrice: triggerFor(stock, profile) });
+  const pot = potential(stock, { horizon: profile.horizon, triggerPrice: triggerFor(stock, profile, ev) });
   const conf = confidence(stock, { profile, evaluation: ev, pot, dataAge: dataAge(), event: stock.nextEvent });
-  const exits = pot ? exitLevels(stock, { pot, conf, atr: atrPct(stock.candles) }) : null;
+  /* exitLevels is bullish by construction — it adds percentages to the entry.
+     Run on a short it produces a target above and a stop below, which the
+     coherence guard then withholds. But it withholds them AFTER they have taken
+     the slot the structure fallback would have filled, so every short shipped
+     with no levels at all while the playbook had direction-aware ones ready.
+     Sells skip the analog path and go straight to structure. */
+  const exits = pot && profile.direction !== "sell"
+    ? exitLevels(stock, { pot, conf, atr: atrPct(stock.candles) }) : null;
   return { potential: pot, confidence: conf, exits };
 }
 
@@ -617,13 +644,29 @@ function scan() {
         const st = pbFallback?.exits?.stop;
         if (st?.mid) levels = { ...levels, stop: { price: st.mid, pct: st.pct } };
       }
-      if (!levels?.primary?.price) {
+      /* `noRoom` is a conclusion, not a gap: the analogs produced a target and it
+         sat closer than the stop. Substituting a structure target there would
+         overwrite a finding with a number — the same manufacturing this whole
+         path exists to prevent. Only an ABSENT estimate falls back. */
+      if (!levels?.primary?.price && !levels?.noRoom) {
         pbFallback = playbookFor(s.symbol, id);
         const prim = pbFallback?.exits?.primary;
         if (prim?.mid) {
           levels = {
             primary: { price: prim.mid, pct: prim.pct },
             stop: pbFallback.exits.stop ? { price: pbFallback.exits.stop.mid, pct: pbFallback.exits.stop.pct } : null,
+            riskReward: pbFallback.exits.riskReward,
+            riskRewardWarning: pbFallback.exits.riskRewardWarning,
+          };
+          levelSource = "structure";
+        } else if (pbFallback?.exits?.noRoom) {
+          /* The structure path reached the same verdict. Carry the conclusion —
+             otherwise the alert says "not established", which is the one thing
+             it is not: it was established and it failed. */
+          const st = pbFallback.exits.stop;
+          levels = {
+            noRoom: true, primary: null,
+            stop: st?.mid ? { price: st.mid, pct: st.pct } : null,
             riskReward: pbFallback.exits.riskReward,
             riskRewardWarning: pbFallback.exits.riskRewardWarning,
           };
@@ -684,6 +727,10 @@ function scan() {
         stopPrice: levels?.stop?.price ?? null,
         riskReward: levels?.riskReward ?? null,
         riskRewardWarning: levels?.riskRewardWarning ?? null,
+        /* Distinguishes "no target could be estimated" from "a target was
+           estimated and it was worse than the stop". Both leave exitPrice null;
+           only one of them is a conclusion, and a reader must be able to tell. */
+        noRoom: !!levels?.noRoom,
         levelWarning: levels?.warning ?? null,
         /* "analogs" — measured from how this stock behaved after comparable
            setups. "structure" — measured from levels on the chart. Stated so the

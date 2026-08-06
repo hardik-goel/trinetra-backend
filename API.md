@@ -244,11 +244,12 @@ Use this for a per-horizon column or tab. `criteria` matches the existing
   "lagDisclosure": "Prices are ~15 minutes delayed. This stock has already moved +3.1% since the trigger level; the estimate below is what may remain, not the full move.",
   "eventWarning": "Results due in 2 days — this signal carries binary event risk.",
   "potential": {
-    "horizon": "swing", "sessions": 5, "triggerPrice": 8827, "movedAlreadyPct": 3.09,
+    "horizon": "swing", "sessions": 5, "triggerPrice": 8827, "basisPrice": 8827,
+    "movedAlreadyPct": 3.09,
     "estRangePct": { "low": 1.2, "median": 2.4, "high": 4.8 },
     "remainingPct": { "low": 0, "median": 0, "high": 1.7 },
     "exhausted": true, "converged": false,
-    "cappedBy": "resistance:swing-high@9169.5",
+    "cappedBy": "atr",
     "resistance": { "level": "swing-high", "price": 9169.5 },
     "analogs": { "n": 10, "medianMFE": 2.36, "medianMAE": -2.67, "winRate": 50 },
     "basis": "10 comparable setups in this stock; median best case +2.36%, typical drawdown -2.67% over 5 sessions. Matched on breakout and volume shape, not on the full criteria set."
@@ -260,9 +261,33 @@ Use this for a per-horizon column or tab. `criteria` matches the existing
   "exits": { "safe": { "pct": 1.2, "price": 9209, "rationale": "…" },
              "primary": {...}, "stretch": {...}, "stop": {...},
              "riskReward": { "toSafe": 0.4, "toPrimary": 0.8, "toStretch": 1.6 },
-             "riskRewardWarning": "Risk-reward to the primary target is below 1:1.",
+             "riskRewardWarning": "Risk-reward to the primary target is 0.8:1 — only the stretch target (1.6:1) pays for this stop.",
              "suggestion": "…reasoning, never an instruction…" } }
 ```
+
+**`basisPrice` is the price every percentage in this block is measured from.**
+It is the trigger for a setup still waiting on its breakout level and spot
+otherwise, decided once so the caps and the levels cannot drift onto different
+prices. A caller checking a level should divide by this, not by `price`.
+
+**`cappedBy` is `"atr"` or `null` — never a resistance level.** The analog
+percentiles are a measurement of what this stock actually did after this setup,
+and every wall that existed on those days is already inside the numbers.
+Truncating them with a structural level double-counted, and because the cap hit
+the 75th percentile and then clamped the median and 25th down to it, one nearby
+pivot collapsed all three onto itself — a 3.4% median swing outcome became a 1.1%
+target against a 4.6% stop. `resistance` is still reported and named in the
+rationale; it informs the reader and no longer rewrites the estimate.
+
+**`noRoom: true` means a target was computed and rejected**, not that none could
+be found. `safe`, `primary` and `stretch` are `null`; `stop` and `riskReward`
+survive; the withheld prices are kept under `withheld` for inspection. The test
+is against `toStretch`, because the stop is deliberately tail-sized
+(`max(1.5×ATR, typical drawdown)`) and judging that against a median-sized reward
+condemns setups a wider exit plan would justify. **Do not fall back to another
+level source on `noRoom`** — it is a conclusion, and replacing it with a number
+from elsewhere destroys the finding. Both the analog and the structure path set
+it, and both mean the same thing.
 
 **Rendering rules that are not optional:**
 - `potential` is **null for `longterm`** — a % target over years is meaningless
@@ -517,7 +542,9 @@ price, but it is not the trade's potential and should never drive risk-reward.
 - `reliability: null` → "insufficient history", never "0%".
 - `entry.chasing: true` → surface `entry.warning` prominently; it is the single
   most common way a good signal becomes a bad trade.
-- `riskRewardWarning` is set when R:R to the primary target is below 1:1.
+- `riskRewardWarning` is set when R:R to the primary target is below 1:1 — naming
+  the stretch as the exit that does pay. When even the stretch fails, `noRoom` is
+  set instead and the target prices are null.
 
 ### `lockQuality` is on snapshot rows as well as signals
 `profileResults[<id>]` now carries `lockQuality`, `lockedOn[]`, `notEvaluated[]`
@@ -692,6 +719,7 @@ schema — feature-detect on `schemaVersion >= 2`, never `=== 2`.
 { "entryPrice": 192.45, "exitPrice": 198.9, "stopPrice": 189.6,
   "riskReward": { "toPrimary": 1.9 }, "riskRewardWarning": null,
   "levelSource": "analogs" | "structure",
+  "noRoom": false,
   "levelWarning": null }
 ```
 
@@ -700,6 +728,15 @@ schema — feature-detect on `schemaVersion >= 2`, never `=== 2`.
   (prior swings, moving averages, round numbers). Intraday setups have no same-day
   analogs, so they use structure. The two are different kinds of claim and the
   alert says which.
+- **`entryPrice` is a price you can transact at.** A breakout level counts as the
+  entry only when the breakout criterion actually passed. `requireAll` is off by
+  default, so a stock could lock on fundamentals and volume while its 20-day high
+  sat untouched overhead and still be handed that level as an entry — BEL fired at
+  ₹399.10 and the alert said "Entry ₹431.50". Unconfirmed breakout ⇒ entry is spot.
+- **`noRoom: true` ⇒ `exitPrice` is null by decision, not by failure.**
+  `riskRewardWarning` carries the reason and both distances. Render it as a
+  finding — "no target offered, less to gain than to lose" — never as "potential
+  not established", which says the opposite of what happened.
 - **`levelWarning`** non-null means levels were **withheld** because the computed
   target or stop landed on the wrong side of the entry. Render the warning; do not
   fall back to showing the raw number.

@@ -580,6 +580,9 @@ function scan() {
         withheldForMissingData: !!ev.withheldForMissingData,
         requireAll: !!ev.requireAll,
         warnings: ev.warnings,
+        // Same information with a stable code, so the dashboard can group,
+        // count and dismiss without matching on prose.
+        warningsDetail: ev.warningsDetail,
       };
 
       // Edge, not level: fire when it BECOMES locked. A level test stays true
@@ -716,7 +719,13 @@ function scan() {
         symbol: s.symbol, name: s.name, price: s.price,
         groups: s.groups || [], evaluation: ev, at: entry.at,
         profileId: id, profileName: profile.name, horizon: profile.horizon,
-        potential: pot, confidence: conf, exits, dataAge: age,
+        /* The levels the ALERT used, not the ones the analog path produced. The
+           record was storing `exits` while the alert rendered `levels`, so a
+           track record could disagree with the message the user acted on — and
+           when the alert fell back to structure the record showed nothing at all. */
+        potential: pot, confidence: conf, exits: levels, dataAge: age,
+        entryPrice: entry.entryPrice, exitPrice: entry.exitPrice,
+        stopPrice: entry.stopPrice, levelSource,
       });
       entry.id = rec.id;
 

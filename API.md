@@ -437,8 +437,10 @@ Render a banner on anything other than `"durable"`:
 
 - `"ephemeral"` — nothing configured. Everything is lost on the next redeploy.
   `fix` carries the two env vars to set.
-- `"degraded"` — configured, but the last push failed. `pendingFiles` exists only
-  on that instance's disk. `POST /storage/flush` retries and returns the new status.
+- `"degraded"` — writes are failing **now**: either nothing has ever been written,
+  or something has failed since the last success. `POST /storage/flush` retries.
+  A queued file on its own is **not** degraded — that is a write that has not
+  happened yet, which is the normal state between a change and the next flush.
 
 `/health` carries the **public subset only** — mode, durable, detail, fix,
 `pendingCount`, `lastPushAt`. It deliberately omits the repo name and the raw

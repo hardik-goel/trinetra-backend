@@ -729,7 +729,13 @@ requireAll=true   locked=false  withheldForMissingData=true
 ```
 
 `withheldForMissingData` distinguishes "criteria did not pass" from "criteria could
-not be checked" — two different facts behind the same silence.
+not be checked" — two different facts behind the same silence. It ships as a
+**boolean on `/snapshot` `profileResults[id]`, on signals, and in
+`/signals/preview`'s `lockState`**, alongside `requireAll`.
+
+**Never branch on the warning text.** The `"Withheld: …"` sentence is written to be
+read, not parsed — rewording it would silently drop a badge that matched on it.
+Anything a caller must branch on ships as a field.
 
 Default stays off so a transient scrape failure never blanks the screener.
 

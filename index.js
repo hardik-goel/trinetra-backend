@@ -506,6 +506,14 @@ function scan() {
       results[id] = {
         count: ev.count, total: ev.total, locked: ev.locked, criteria: ev.criteria,
         lockQuality: ev.lockQuality, lockedOn: ev.lockedOn, notEvaluated: ev.notEvaluated,
+        /* The machine-readable form of the "Withheld: …" warning. The prose was
+           reaching callers while the boolean behind it was not, which left a
+           renderer parsing an English sentence to decide what to draw — and a
+           reworded sentence would then silently drop the badge. Anything a caller
+           must branch on ships as a field; the sentence is for reading, not for
+           parsing. */
+        withheldForMissingData: !!ev.withheldForMissingData,
+        requireAll: !!ev.requireAll,
         warnings: ev.warnings,
       };
 
@@ -579,6 +587,10 @@ function scan() {
         volX: +(ev.volX || 0).toFixed(1), dayChg: +(ev.dayChg || 0).toFixed(1),
         count: ev.count, total: ev.total, at: Date.now(),
         lockQuality: ev.lockQuality, lockedOn: ev.lockedOn, notEvaluated: ev.notEvaluated,
+        // Same pair as the snapshot row. A signal that fired can never itself be
+        // withheld, but the fields exist on both so a caller binds one shape.
+        withheldForMissingData: !!ev.withheldForMissingData,
+        requireAll: !!ev.requireAll,
         criteriaWarnings: ev.warnings,
         // The criteria block in the alert needs the values that made each check
         // pass, not just the criterion names.

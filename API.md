@@ -686,6 +686,28 @@ schema — feature-detect on `schemaVersion >= 2`, never `=== 2`.
 
 ---
 
+### Signals carry a stop, an R:R and where the levels came from
+
+```json
+{ "entryPrice": 192.45, "exitPrice": 198.9, "stopPrice": 189.6,
+  "riskReward": { "toPrimary": 1.9 }, "riskRewardWarning": null,
+  "levelSource": "analogs" | "structure",
+  "levelWarning": null }
+```
+
+- **`levelSource`** — `"analogs"` means the target is measured from how this stock
+  behaved after comparable setups; `"structure"` means it is read off the chart
+  (prior swings, moving averages, round numbers). Intraday setups have no same-day
+  analogs, so they use structure. The two are different kinds of claim and the
+  alert says which.
+- **`levelWarning`** non-null means levels were **withheld** because the computed
+  target or stop landed on the wrong side of the entry. Render the warning; do not
+  fall back to showing the raw number.
+- A buy's target is always above its entry and its stop below it; a sell's the
+  mirror. Enforced at the boundary — an inverted level never leaves the process.
+
+---
+
 ### Shorting — the `short` profile
 
 A SELL on a stock the user does not own. **Ships disabled**; enable with

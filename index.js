@@ -469,6 +469,12 @@ function analyse(stock, profile, ev) {
   return { potential: pot, confidence: conf, exits };
 }
 
+/* The price a trade actually starts at: the trigger for an untriggered breakout,
+   the entry zone for a structural setup, spot otherwise. */
+function entryBasis(pot, pb, stock) {
+  return pot?.triggerPrice ?? pb?.entry?.zone?.high ?? stock?.price ?? null;
+}
+
 function scan() {
   const active = enabledProfiles(config.profiles);
   const limits = config.alertLimits;
@@ -512,6 +518,57 @@ function scan() {
       firedToday.add(key);
 
       const { potential: pot, confidence: conf, exits } = analyse(s, profile, ev);
+
+      /* An alert with no exit is not actionable, and that is how most intraday
+         alerts went out: `exits` is derived from ANALOG history — how this stock
+         behaved after comparable setups — and an intraday setup has no same-day
+         analogs, so it returned null and the alert said "Potential not
+         established" with no target at all.
+
+         The playbook derives its levels from structure instead: prior swings,
+         moving averages, round numbers, the 52-week high. Those exist regardless
+         of analog history. So it is the fallback, and `levelSource` states which
+         one produced the numbers — a level measured from structure is a different
+         claim from one measured against this stock's own past behaviour, and the
+         two must not be silently interchangeable. */
+      let levels = exits, levelSource = exits ? "analogs" : null, pbFallback = null;
+      if (!levels?.primary?.price) {
+        pbFallback = playbookFor(s.symbol, id);
+        const prim = pbFallback?.exits?.primary;
+        if (prim?.mid) {
+          levels = {
+            primary: { price: prim.mid, pct: prim.pct },
+            stop: pbFallback.exits.stop ? { price: pbFallback.exits.stop.mid, pct: pbFallback.exits.stop.pct } : null,
+            riskReward: pbFallback.exits.riskReward,
+            riskRewardWarning: pbFallback.exits.riskRewardWarning,
+          };
+          levelSource = "structure";
+        }
+      }
+      /* Final guard. Whatever produced the numbers, a buy's target must sit above
+         its entry and its stop below it, and a sell's the mirror. An inverted
+         level is not a weak signal — it is an instruction to sell lower than you
+         bought, and it must never leave the process. Withheld with a reason
+         rather than corrected by guesswork, because a level nobody can justify is
+         worth less than no level. */
+      if (levels && entryBasis(pot, pbFallback, s)) {
+        const basis = entryBasis(pot, pbFallback, s);
+        const isSellDir = profile.direction === "sell";
+        const tgt = levels.primary?.price, stp = levels.stop?.price;
+        const badTarget = tgt != null && (isSellDir ? tgt >= basis : tgt <= basis);
+        const badStop = stp != null && (isSellDir ? stp <= basis : stp >= basis);
+        if (badTarget || badStop) {
+          console.warn(`[levels] ${s.symbol}/${id}: incoherent (${isSellDir ? "sell" : "buy"} basis=${basis} target=${tgt} stop=${stp}) — withheld`);
+          levels = {
+            ...levels,
+            primary: badTarget ? null : levels.primary,
+            stop: badStop ? null : levels.stop,
+            riskReward: null, riskRewardWarning: null,
+            warning: `Levels withheld: the computed ${badTarget && badStop ? "target and stop were" : badTarget ? "target was" : "stop was"} on the wrong side of the entry. No usable level rather than a misleading one.`,
+          };
+        }
+      }
+
       const age = dataAge();
       const event = s.nextEvent;
       const horizonDays = HORIZON_SESSIONS[profile.horizon] ?? 5;
@@ -532,9 +589,17 @@ function scan() {
            another one — a stock failing a breakout test is not thereby breaking
            down. */
         direction: profile.direction === "sell" ? "sell" : "buy",
-        entryPrice: pot?.triggerPrice ?? null,
-        exitPrice: exits?.primary?.price ?? null,
-        potentialLeftPct: exits?.primary?.pct ?? null,
+        entryPrice: pot?.triggerPrice ?? pbFallback?.entry?.zone?.high ?? null,
+        exitPrice: levels?.primary?.price ?? null,
+        potentialLeftPct: levels?.primary?.pct ?? null,
+        stopPrice: levels?.stop?.price ?? null,
+        riskReward: levels?.riskReward ?? null,
+        riskRewardWarning: levels?.riskRewardWarning ?? null,
+        levelWarning: levels?.warning ?? null,
+        /* "analogs" — measured from how this stock behaved after comparable
+           setups. "structure" — measured from levels on the chart. Stated so the
+           reader knows which kind of claim the number is. */
+        levelSource,
         appUrl: process.env.APP_URL || null,
         dataAge: age,
         potential: pot, confidence: conf, exits,

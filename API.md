@@ -708,6 +708,55 @@ schema — feature-detect on `schemaVersion >= 2`, never `=== 2`.
 
 ---
 
+### `requireAll` — go quiet rather than lock on a thinner test
+
+Per profile, **default off**. `PATCH /profiles/:id { "requireAll": true }`.
+
+By default a criterion with no data is excluded rather than allowed to veto — that
+rule is what stopped the eye opening at all. Its cost is not evenly distributed:
+fundamentals are missing precisely for the obscure and newly-listed names the
+fundamentals criterion exists to exclude, so the filter disappears exactly where it
+does the most work. That is adverse selection, not a display problem.
+
+With `requireAll: true` the profile refuses to lock while any criterion is
+unanswered:
+
+```
+requireAll=false  locked=true   quality=partial  passed=[Breakout, Volume shocker]  notEvaluated=[Fundamentals]
+requireAll=true   locked=false  withheldForMissingData=true
+  "Withheld: Fundamentals had no data, and this profile requires every criterion to
+   be answered. It would otherwise have locked on 2 of 3."
+```
+
+`withheldForMissingData` distinguishes "criteria did not pass" from "criteria could
+not be checked" — two different facts behind the same silence.
+
+Default stays off so a transient scrape failure never blanks the screener.
+
+**`lockQuality` is now stored on the track-record entry**, not computed at display
+time, along with `requireAll` and `notEvaluated`. Whether a lock cleared every
+criterion or only the ones with data is a property of the moment it fired, and the
+missing data may be present by the time anyone looks. A hit rate blended across
+three-criteria and two-criteria locks describes a strategy that was never run, and
+that cannot be repaired after the fact.
+
+### `/playbook/all?profile=all`
+
+`all` now means: **one row per symbol, built under the profile that symbol is
+currently locked under**, falling back to Swing when it is locked under none. Each
+row carries `profileId` and `profileChosenBy` (`"locked-under"` | `"default"`), and
+the response carries a `mode` sentence describing exactly that.
+
+Previously `all` was answered with Swing rows stamped `profileId: "all"` — a profile
+that does not exist. An unknown profile now **404s with the known list** rather than
+silently becoming Swing; a default the caller cannot detect is a lie.
+
+Rows also mirror `riskReward` and `riskRewardWarning` at the top level. `exits.*`
+stays canonical; the mirrors exist because signals hoist the same fields and a
+caller reading one shape against the other finds null and assumes it is absent.
+
+---
+
 ### `GET /stock?symbol=` — everything about one symbol
 
 One call that answers "why is this stock here and not there". Built because that

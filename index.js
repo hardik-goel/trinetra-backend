@@ -497,7 +497,7 @@ function scan() {
     const results = {};
     const newlyLocked = [];
     for (const [id, profile] of active) {
-      const ev = evaluate(s, profile.criteria);
+      const ev = evaluate(s, profile.criteria, { requireAll: !!profile.requireAll });
       /* lockQuality belongs here, not only on a fired signal. A stock that is
          locked-but-partial right now — or whose fundamentals could not be
          evaluated — is in that state whether or not a signal fired today, and a
@@ -860,7 +860,7 @@ function scanCycles(opts = {}) {
     });
 
     if (sellP?.enabled !== false) {
-      const ev = evaluate(withCtx, sellP.criteria);
+      const ev = evaluate(withCtx, sellP.criteria, { requireAll: !!sellP.requireAll });
       if (ev.locked || opts.force === "sell") out.sell.push({
         ...render(ev, "sell"),
         holding: {
@@ -876,7 +876,7 @@ function scanCycles(opts = {}) {
     }
 
     if (buyP?.enabled !== false) {
-      const ev = evaluate(withCtx, buyP.criteria);
+      const ev = evaluate(withCtx, buyP.criteria, { requireAll: !!buyP.requireAll });
       const trend = trendOf(stock.candles, stock.price, 50);
       /* A pullback inside an uptrend is an opportunity; the same fall below the
          trend is a falling knife. Withheld rather than fired — and SAID, because
@@ -1057,7 +1057,7 @@ app.get("/signals/preview", (req, res) => {
   const stock = stockBySymbol()[symbol];
   if (!stock) return res.status(404).json({ error: `${symbol} is not in the scanned universe` });
 
-  const ev = evaluate(stock, profile.criteria);
+  const ev = evaluate(stock, profile.criteria, { requireAll: !!profile.requireAll });
   const isSell = profile.direction === "sell";
   const pb = playbookFor(symbol, profileId);
   const sh = isSell ? fno.shortability(symbol) : null;
@@ -1468,6 +1468,11 @@ app.patch("/profiles/:id", (req, res) => {
   if (!p) return res.status(404).json({ error: "no such profile" });
   for (const k of ["name", "horizon", "requiresLiveData"]) if (req.body?.[k] !== undefined) p[k] = req.body[k];
   if (req.body?.enabled !== undefined) p.enabled = !!req.body.enabled;
+  // Whether this profile goes quiet rather than locking on a thinner test than
+  // it advertises. Per profile, because the answer differs by what the profile
+  // is for: a screening profile would rather see something, a profile feeding
+  // the track record needs a homogeneous sample.
+  if (req.body?.requireAll !== undefined) p.requireAll = !!req.body.requireAll;
   if (req.body?.alerts) p.alerts = { ...p.alerts, ...req.body.alerts };
   if (Array.isArray(req.body?.criteria)) p.criteria = req.body.criteria;
   saveConfig(); scan();
@@ -1505,7 +1510,7 @@ app.post("/holdings", (req, res) => {
   const stock = stockBySymbol()[sym];
   const profileId = req.body?.profileId || "swing";
   const p = config.profiles[profileId];
-  const ev = stock && p ? evaluate(stock, p.criteria) : null;
+  const ev = stock && p ? evaluate(stock, p.criteria, { requireAll: !!p.requireAll }) : null;
   const h = holdings.add({ ...req.body, profileId }, stock, ev);
   if (!h) return res.status(400).json({ error: "symbol required, and it must be in the watchlist or carry an entryPrice" });
   holdings.markToMarket(stockBySymbol());
@@ -1658,7 +1663,7 @@ app.get("/decision", (req, res) => {
   const profile = config.profiles[id];
   if (!profile) return res.status(404).json({ error: "no such profile" });
 
-  const ev = evaluate(stock, profile.criteria);
+  const ev = evaluate(stock, profile.criteria, { requireAll: !!profile.requireAll });
   const { potential: pot, confidence: conf, exits } = analyse(stock, profile, ev);
   res.json({
     symbol: sym, profileId: id, profileName: profile.name, horizon: profile.horizon,
@@ -1728,12 +1733,31 @@ app.get("/playbook", (req, res) => {
 });
 
 app.get("/playbook/all", (req, res) => {
-  const profileId = cleanId(req.query.profile || "swing");
-  const profile = config.profiles[profileId] || config.profiles.swing;
+  const requested = cleanId(req.query.profile || "swing");
+  /* "all" was silently answered with swing rows stamped profileId: "all" — a
+     profile that does not exist. An unknown profile falling back to a default is
+     a lie the caller cannot detect, and the dashboard was defaulting to it.
+
+     It now means something: one row per symbol, built under the profile that
+     symbol is actually locked under, falling back to swing when it is locked
+     under none. `profileId` on each row says which one produced it. */
+  const isAll = requested === "all";
+  const profileId = isAll ? "swing" : requested;
+  const profile = config.profiles[profileId];
+  if (!profile) {
+    return res.status(404).json({ error: `no such profile: ${requested}`,
+      known: [...Object.keys(config.profiles), "all"] });
+  }
   const isShortProfile = profile?.direction === "sell";
   const rows = [];
+  // Screener profiles only — a holdings-only profile has no meaning for a symbol
+  // the user does not hold, and would silently retitle rows it cannot apply to.
+  const screenerIds = enabledProfiles(config.profiles).map(([id]) => id);
   for (const s of snapshot.data) {
-    const pb = playbookFor(s.symbol, profileId);
+    const rowProfileId = isAll
+      ? (screenerIds.find(id => s.profileResults?.[id]?.locked) || profileId)
+      : profileId;
+    const pb = playbookFor(s.symbol, rowProfileId);
     if (!pb) continue;
     if (pb.insufficient) {
       rows.push({ symbol: s.symbol, price: s.price, insufficient: true, reading: pb.reading });
@@ -1779,7 +1803,10 @@ app.get("/playbook/all", (req, res) => {
          answer a question the row already knows, and the horizon printed beside
          it may be one the market will not honour. */
       ...(shortInfo || {}),
-      profileId,
+      profileId: rowProfileId,
+      // In "all" mode, whether this row's profile was chosen because the stock is
+      // locked under it, or is just the fallback.
+      ...(isAll ? { profileChosenBy: (s.profileResults?.[rowProfileId]?.locked ? "locked-under" : "default") } : {}),
       // Clamped on the row too, so the horizon shown is one the market allows.
       horizon: shortInfo?.horizonClamped ? "intraday" : pb.horizon,
       lockedUnder: locked,
@@ -1787,6 +1814,11 @@ app.get("/playbook/all", (req, res) => {
                chasing: pb.entry.chasing, warning: pb.entry.warning,
                convergence: pb.entry.convergence, families: pb.entry.families,
                confidence: { score: pb.entry.confidence.score, band: pb.entry.confidence.band } },
+      /* Mirrors of exits.riskReward*. `exits` stays canonical; these exist because
+         signals hoist the same fields to the top level and a caller reading one
+         shape against the other finds null and assumes it is missing. */
+      riskReward: pb.exits.riskReward ?? null,
+      riskRewardWarning: pb.exits.riskRewardWarning ?? null,
       exits: {
         primary: pb.exits.primary
           ? { zone: pb.exits.primary.zone, pct: pb.exits.primary.pct,
@@ -1804,7 +1836,14 @@ app.get("/playbook/all", (req, res) => {
       reading: pb.reading,
     });
   }
-  res.json({ profile: profileId, asOf: snapshot.at, dataAge: dataAge(), rows });
+  res.json({
+    profile: isAll ? "all" : profileId,
+    /* Says what "all" actually did, so the UI can label the view honestly. */
+    mode: isAll
+      ? "One row per symbol, built under the profile that symbol is currently locked under; symbols locked under none fall back to Swing. Each row states its profileId and profileChosenBy."
+      : `Every symbol evaluated under the ${profile.name} profile.`,
+    asOf: snapshot.at, dataAge: dataAge(), rows,
+  });
 });
 
 app.get("/analysts", (req, res) => {

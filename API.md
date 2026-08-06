@@ -708,6 +708,42 @@ schema — feature-detect on `schemaVersion >= 2`, never `=== 2`.
 
 ---
 
+### `GET /stock?symbol=` — everything about one symbol
+
+One call that answers "why is this stock here and not there". Built because that
+question was spread across six panels, none of which explained the others.
+
+```json
+{ "symbol": "HAL", "name": "Hindustan Aeronautics Limited", "price": 4890.5,
+  "lockedNow": ["Intraday (4/4)", "Swing (1/1)", "Positional (3/3)"],
+  "profiles": [ { "id": "positional", "name": "Positional", "horizon": "positional",
+                  "locked": true,
+                  "passed": ["Fundamentals","50-day breakout","Sustained volume"],
+                  "failed": [], "skipped": [] }, … ],
+  "fundamentals": { … }, "fundamentalsMissing": false,
+  "playbook": { "actionLabel": "Entry", "entry": {…}, "target": 5119.33,
+                "stop": 4790.99, "riskReward": 2.31 },
+  "shortability": { "fno": true, "lotSize": 150 },
+  "holding": null,
+  "signalsFired": { "count": 3, "recent": [ … ] } }
+```
+
+Unknown symbols return 404 with `didYouMean` (prefix matches), so a search box can
+suggest rather than dead-end.
+
+### Track-record rows now say which profile locked
+
+History records gained **`profileName`** and **`lockedOn`** (the readable criteria
+names). `combo` — `"O+R+V+W"` — is a grouping key, not a label:
+
+- It reads like the original four when it is in fact the **Intraday** profile's four.
+- Two different profiles with the same count render identically.
+
+**Render `profileName` and `lockedOn` in the row.** `"Intraday · Opening range,
+Above VWAP, Volume surge, Upper day range"` is unambiguous; `"O+R+V+W 4/4"` is not.
+
+---
+
 ### Shorting — the `short` profile
 
 A SELL on a stock the user does not own. **Ships disabled**; enable with

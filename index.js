@@ -638,7 +638,7 @@ function scan() {
       const rec = history.recordSignal({
         symbol: s.symbol, name: s.name, price: s.price,
         groups: s.groups || [], evaluation: ev, at: entry.at,
-        profileId: id, horizon: profile.horizon,
+        profileId: id, profileName: profile.name, horizon: profile.horizon,
         potential: pot, confidence: conf, exits, dataAge: age,
       });
       entry.id = rec.id;
@@ -2101,6 +2101,81 @@ app.post("/fundamentals/backfill", (_, res) => {
 
 /* Can this stock be shorted, and for how long. Exposed on its own because the
    answer decides whether a signal is actionable at all. */
+/* Everything known about one stock, in one call.
+
+   Built because the answer to "why is this here and not there" was scattered
+   across six panels: the criteria tab shows what is locked NOW, the track record
+   shows what fired THEN, the playbook shows levels, and none of them says why a
+   stock appears in one and not the others. That is a question about a single
+   symbol, so it gets a single endpoint. */
+app.get("/stock", (req, res) => {
+  const symbol = String(req.query.symbol || "").trim().toUpperCase();
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+
+  const stock = stockBySymbol()[symbol];
+  if (!stock) {
+    const known = SYMBOLS.filter(x => x.startsWith(symbol.slice(0, 3))).slice(0, 8);
+    return res.status(404).json({ error: `${symbol} is not in the scanned universe`, didYouMean: known });
+  }
+
+  /* Per profile: locked or not, and WHICH criteria did what. "3 of 4" with no
+     names is the thing that makes the track record unreadable. */
+  const profiles = Object.entries(config.profiles)
+    .filter(([, p]) => p.enabled !== false)
+    .map(([id, p]) => {
+      const pr = stock.profileResults?.[id];
+      return {
+        id, name: p.name, horizon: p.horizon,
+        direction: p.direction === "sell" ? "sell" : "buy",
+        appliesTo: p.appliesTo || "universe",
+        locked: !!pr?.locked,
+        passed: (pr?.criteria || []).filter(c => c.pass).map(c => c.name),
+        failed: (pr?.criteria || []).filter(c => !c.pass && !c.skipped).map(c => c.name),
+        skipped: (pr?.criteria || []).filter(c => c.skipped).map(c => c.name),
+        lockQuality: pr?.lockQuality ?? null,
+      };
+    });
+
+  const fired = history.all().filter(r => r.symbol === symbol)
+    .slice(0, 20)
+    .map(r => ({
+      id: r.id, firedAt: r.firedAt, price: r.price, direction: r.direction,
+      profileId: r.profileId, profileName: r.profileName || r.profileId,
+      lockedOn: r.lockedOn || null, combo: r.combo, count: r.count, total: r.total,
+      outcome: r.outcome, confidence: r.confidence?.score ?? null,
+    }));
+
+  const held = holdings.open().find(h => h.symbol === symbol) || null;
+
+  res.json({
+    symbol, name: stock.name, price: stock.price, sector: stock.sector || null,
+    groups: stock.groups || [],
+    dataAge: dataAge(),
+    /* The one-line answer to "why is this stock here": which profiles it
+       currently satisfies, in plain words. */
+    lockedNow: profiles.filter(p => p.locked).map(p => `${p.name} (${p.passed.length}/${p.passed.length + p.failed.length + p.skipped.length})`),
+    profiles,
+    fundamentals: fundCache[symbol] ?? null,
+    fundamentalsMissing: !fundCache[symbol],
+    playbook: (() => {
+      const pb = playbookFor(symbol, "swing");
+      if (!pb || pb.insufficient) return { insufficient: true, reading: pb?.reading ?? null };
+      return {
+        actionLabel: pb.exits.actionLabel, targetLabel: pb.exits.targetLabel,
+        entry: pb.entry.zone, target: pb.exits.primary?.mid ?? null,
+        stop: pb.exits.stop?.mid ?? null,
+        riskReward: pb.exits.riskReward?.toPrimary ?? null,
+        confidence: pb.exits.confidence ? { score: pb.exits.confidence.score, band: pb.exits.confidence.band } : null,
+        reading: pb.reading,
+      };
+    })(),
+    shortability: fno.shortability(symbol),
+    holding: held ? { entryPrice: held.entryPrice, markedAt: held.markedAt, cycle: cycle.derive(held, stock.price) } : null,
+    signalsFired: { count: fired.length, recent: fired },
+    nextEvent: stock.nextEvent ?? null,
+  });
+});
+
 app.get("/shortability", (req, res) => {
   const sym = String(req.query.symbol || "").trim().toUpperCase();
   if (!sym) return res.status(400).json({ error: "symbol required" });

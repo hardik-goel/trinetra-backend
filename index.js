@@ -16,7 +16,9 @@
 import express from "express";
 import cors from "cors";
 import * as db from "./lib/db.js";
-import { attachUser, csrfGuard, authRouter, requireAuth, requireAdmin } from "./lib/authRoutes.js";
+import * as ud from "./lib/userData.js";
+import * as tenantsLib from "./lib/tenants.js";
+import { attachUser, csrfGuard, authRouter, requireAuth, requireAdmin, setUserCreatedHook } from "./lib/authRoutes.js";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
@@ -354,7 +356,7 @@ function applyFund(symbols) {
   if (!snapshot.data.length) return;
   const touched = new Set(symbols);
   snapshot = { ...snapshot, data: snapshot.data.map(q => touched.has(q.symbol) ? { ...q, fund: fundFor(q.symbol) } : q) };
-  scan(); // fresher fundamentals can lock or unlock a gate
+  scan().catch(e => console.error("[scan]", e.message)); // fresher fundamentals can lock or unlock a gate
 }
 
 /* Yahoo's daily bar reports volume ACCUMULATED SO FAR, so mid-session it holds a
@@ -424,7 +426,24 @@ async function refreshOnce() {
   if (today !== lastDay) { firedToday.clear(); lastDay = today; }
 
   try {
-    const quotes = await provider(SYMBOLS, { intraday: needsIntraday(config.profiles) });
+    /* The union of every active user's list. One fetch pass serves everyone:
+       a quote is the same fact for all of them, and fetching per user would
+       multiply the only expensive part of the scan by the number of accounts.
+       Falls back to the global list when accounts are off or the lookup fails —
+       an unreachable database must not empty the universe and report "nothing
+       matched", which is indistinguishable from a quiet market. */
+    let toFetch = SYMBOLS;
+    if (db.enabled) {
+      try {
+        const union = await tenantsLib.unionUniverse(MAX_SYMBOLS);
+        if (union?.length) toFetch = union;
+        else console.warn("[scan] no active user watches any symbol — nothing to fetch");
+      } catch (e) {
+        console.error(`[scan] union universe lookup failed, falling back to the local list: ${e.message}`);
+      }
+    }
+    scanProgress = { ...scanProgress, total: toFetch.length };
+    const quotes = await provider(toFetch, { intraday: needsIntraday(config.profiles) });
     // Merge whatever forecasts are known now — a sleeping Oracle must never
     // hold up a market refresh. The fetch runs in the background and re-merges
     // into the published snapshot the moment it lands.
@@ -442,7 +461,7 @@ async function refreshOnce() {
     };
     const withFcst = snapshot.data.filter(q => q.fcst).length;
     console.log(`[trinetra] ${snapshot.data.length} symbols via ${PROVIDER} · ${withFcst} with a forecast`);
-    scan();
+    await scan().catch(e => console.error(`[scan] pass failed: ${e.stack || e.message}`));
     // Track record upkeep: what past signals did next, and where open bets stand.
     const priceBySymbol = Object.fromEntries(snapshot.data.map(q => [q.symbol, q.price]));
     history.markOutcomes(priceBySymbol);
@@ -463,7 +482,7 @@ function applyForecasts(forecasts) {
   snapshot = { ...snapshot, data: mergeForecasts(snapshot.data, forecasts) };
   const withFcst = snapshot.data.filter(q => q.fcst).length;
   console.log(`[oracle] merged into snapshot · ${withFcst}/${snapshot.data.length} stocks carry an fcst`);
-  scan(); // a forecast can complete a confluence
+  scan().catch(e => console.error("[scan]", e.message)); // a forecast can complete a confluence
 }
 
 /* The trigger level a setup qualified at — what "already moved" is measured
@@ -551,13 +570,19 @@ function entryBasis(pot, pb, stock) {
 }
 
 /* What the screener is doing right now, in a shape a UI can branch on. */
-function scanState() {
+function scanState(tenant = null) {
   const warming = snapshot.data.length === 0;
+  /* Counted against what THIS user watches, not against the union. Telling
+     someone with 40 symbols that 500 were scanned is true of the instance and
+     useless to them — and it makes a missing symbol of theirs look present. */
+  const mine = tenant && !tenant.legacy
+    ? snapshot.data.filter(s => tenant.symbols.has(s.symbol)).length
+    : snapshot.data.length;
   return {
     warming,
     scanning: refreshing,
-    symbols: snapshot.data.length,
-    universe: SYMBOLS.length,
+    symbols: mine,
+    universe: tenant && !tenant.legacy ? tenant.symbols.size : SYMBOLS.length,
     lastCompletedAt: snapshot.at || null,
     /* True while the rows being served come from the previous run rather than a
        pass completed by this instance. The prices are real but old. */
@@ -575,10 +600,27 @@ function scanState() {
   };
 }
 
-function scan() {
-  const active = enabledProfiles(config.profiles);
+/* One person's pass over the shared snapshot.
+   `tenant` carries whose criteria to apply, whose symbols to look at, where the
+   record goes and which phone to ring. In single-user mode there is exactly one
+   tenant built from the global config, so this is the same code path it always
+   was — which is the point: a second path for the multi-user case is where a
+   leak would live unnoticed. */
+function scanTenant(tenant) {
+  const active = enabledProfiles(tenant.profiles);
+  if (!active.length) return { candidates: 0, sent: 0, suppressed: {} };
   const limits = config.alertLimits;
   const now = Date.now();
+  /* The snapshot holds the union of everyone's symbols. A tenant sees only the
+     ones they actually watch — otherwise adding a symbol to your list would
+     start firing signals on it for every other account. */
+  const rows = tenant.symbols
+    ? snapshot.data.filter(s => tenant.symbols.has(s.symbol))
+    : snapshot.data;
+  /* Namespaces the edge-trigger ledger and the per-day dedupe. Without it two
+     users watching the same stock share one "already fired today" flag and the
+     second one is silently never told. */
+  const ns = tenant.id == null ? "" : `u${tenant.id}:`;
 
   /* Delivery is gated; recording is not. Every signal still reaches the track
      record — suppressing an alert is a statement about when the user can act,
@@ -593,7 +635,7 @@ function scan() {
   // Collected per symbol, so one stock locking three profiles is one alert.
   const pending = [];
 
-  for (const s of snapshot.data) {
+  for (const s of rows) {
     const results = {};
     const newlyLocked = [];
     for (const [id, profile] of active) {
@@ -622,8 +664,8 @@ function scan() {
 
       // Edge, not level: fire when it BECOMES locked. A level test stays true
       // all evening once the tape stops, which is what caused the repeats.
-      const becameLocked = gate.isNewLock(s.symbol, id, ev.locked);
-      const key = `${id}:${s.symbol}`;
+      const becameLocked = gate.isNewLock(s.symbol, `${ns}${id}`, ev.locked);
+      const key = `${ns}${id}:${s.symbol}`;
       if (!ev.locked || firedToday.has(key)) continue;
       if (!becameLocked) continue;
       firedToday.add(key);
@@ -782,7 +824,12 @@ function scan() {
           ? `${event.type === "results" ? "Results" : event.type} due in ${event.daysAway} day${event.daysAway === 1 ? "" : "s"} — this signal carries binary event risk.`
           : null,
       };
-      signalLog = [entry, ...signalLog].slice(0, 100);
+      /* The live tail is per tenant. One shared tail would show every user the
+         other users' signals — which for a stock nobody else watches is also a
+         disclosure of what they watch. */
+      entry.userId = tenant.id ?? null;
+      tailFor(tenant).unshift(entry);
+      tailFor(tenant).splice(100);
 
       // Durable record with the evidence at fire time — /signals is a live tail,
       // this is the thing the track record is computed from.
@@ -801,6 +848,18 @@ function scan() {
       });
       entry.id = rec.id;
 
+      /* The durable copy for an account. `history` is the legacy file store and
+         stays authoritative in single-user mode; for a real account the row is
+         written to Postgres under their id. Written after the file record so the
+         id is the same in both, which is what lets a track record row be matched
+         to the alert that produced it. Fire-and-forget with a logged failure:
+         the alert must not wait on a database round trip, and a lost record is
+         a gap in the track record, not a missed trade. */
+      if (tenant.id != null) {
+        ud.signals.record(tenant.id, { ...rec, userId: tenant.id })
+          .catch(e => console.warn(`[history] user ${tenant.id} ${s.symbol}/${id}: ${e.message}`));
+      }
+
       // A profile can be scanned but kept silent — useful while validating
       // Intraday without being paged by it.
       if (profile.alerts?.telegram !== false) newlyLocked.push({ profile, entry });
@@ -812,35 +871,96 @@ function scan() {
       newlyLocked.sort((a, b) => (b.entry.confidence?.score ?? 0) - (a.entry.confidence?.score ?? 0));
       pending.push({ symbol: s.symbol, legs: newlyLocked, price: s.price, volume: s.volToday });
     }
-    s.profileResults = results;
-    // Flat list of the profiles this symbol currently satisfies — an "All
-    // profiles" view needs this and nothing else.
-    s.profilesLocked = Object.entries(results).filter(([, r]) => r.locked).map(([id]) => id);
+    /* Evaluation results are written onto the shared snapshot row ONLY for the
+       single-user tenant. They are a function of whose criteria ran, so with
+       several tenants the last one through the loop would overwrite the others
+       and every user would read the last user's verdict off their own dashboard.
+       For real accounts the annotated view is built per request and cached —
+       see `viewFor`. */
+    if (tenant.legacy) {
+      s.profileResults = results;
+      // Flat list of the profiles this symbol currently satisfies — an "All
+      // profiles" view needs this and nothing else.
+      s.profilesLocked = Object.entries(results).filter(([, r]) => r.locked).map(([id]) => id);
 
-    /* Compact decision summary per profile, so the watchlist can sort by
-       confidence, remaining potential or risk-reward without a call per row.
-       Deliberately NOT the full payload: the components, rationale and analog
-       detail are heavy and only wanted when a row is opened, which is what
-       /decision serves. */
-    s.decisions = {};
-    for (const [id, profile] of active) {
-      const d = decisionSummary(s, profile, results[id]);
-      if (d) s.decisions[id] = d;
+      /* Compact decision summary per profile, so the watchlist can sort by
+         confidence, remaining potential or risk-reward without a call per row.
+         Deliberately NOT the full payload: the components, rationale and analog
+         detail are heavy and only wanted when a row is opened, which is what
+         /decision serves. */
+      s.decisions = {};
+      for (const [id, profile] of active) {
+        const d = decisionSummary(s, profile, results[id]);
+        if (d) s.decisions[id] = d;
+      }
     }
   }
 
-  deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tally, now });
-  scanExits(windowOpen);
-  scanCycles();
-  // Built ahead of the click: the panel opens instantly instead of computing 303
-  // playbooks while the user waits.
+  deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tally, now, tenant });
+  if (tenant.legacy) {
+    /* Holdings-driven scans stay single-user for now. They read the global
+       holdings file, and running them per tenant before that file is per-user
+       would mail every account exit signals about the owner's positions —
+       a worse failure than not sending them at all. */
+    scanExits(windowOpen);
+    scanCycles();
+    warmPlaybooks();
+  }
+  return tally;
+}
+
+/* Live tails, one per tenant. Kept in a Map rather than on the tenant object
+   because tenants are rebuilt from the database every minute and the tail must
+   outlive that. */
+const tails = new Map();
+const tailKey = t => (t.id == null ? "legacy" : `u${t.id}`);
+const tailFor = t => {
+  const k = tailKey(t);
+  if (!tails.has(k)) tails.set(k, []);
+  return tails.get(k);
+};
+
+/** Every tenant, one pass each, over the one snapshot the fetcher produced. */
+async function scan() {
+  if (!db.enabled) {
+    return scanTenant(tenantsLib.legacyTenant({
+      profiles: config.profiles, symbols: null, groups: GROUPS,
+      telegram: config.alerts?.telegram, alertsOn: !!config.alerts?.telegram?.on,
+    }));
+  }
+  let list = [];
+  try {
+    list = await tenantsLib.tenants();
+  } catch (e) {
+    /* A database failure must not silently stop everyone's alerts. Loud, and
+       the market side of the pass keeps working. */
+    console.error(`[scan] could not load accounts — NO alerts will be sent this pass: ${e.message}`);
+    return;
+  }
+  for (const t of list) {
+    try { scanTenant(t); }
+    catch (e) {
+      // One account's bad criteria must not stop the others being scanned.
+      console.error(`[scan] user ${t.id} (${t.email}) failed: ${e.stack || e.message}`);
+    }
+  }
   warmPlaybooks();
 }
 
 /* Everything between "a signal happened" and "the user's phone buzzes".
    Recording already happened above; nothing here can change the track record. */
-function deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tally, now }) {
-  const tg = config.alerts?.telegram;
+function deliver(pending, { windowOpen, win, stale, snapshotAgeMin, limits, tally, now, tenant }) {
+  /* Whose phone. The single-user app read one bot token and one chat id from the
+     environment; with several accounts on one instance that would send every
+     user's signals to whoever's chat id happened to be in the env — the most
+     direct possible leak of what someone is trading. A real account uses its own
+     credentials or gets no alert at all; there is no fallback to a shared chat,
+     because the fallback IS the leak. */
+  const tg = tenant?.legacy === false
+    ? (tenant.telegram?.token && tenant.telegram?.chatId
+        ? { on: tenant.alertsOn, token: tenant.telegram.token, chatId: tenant.telegram.chatId }
+        : null)
+    : config.alerts?.telegram;
   const armed = !!tg?.on;
 
   const MIN_POTENTIAL_PCT = +(process.env.MIN_POTENTIAL_PCT ?? 5);
@@ -1202,7 +1322,35 @@ console.log(`[cors] ${UI_ORIGIN === "*"
 app.use(express.json());
 app.use(attachUser);
 app.use(csrfGuard);
+/* A new account starts usable: the shipped criteria and the current universe,
+   copied rather than shared so editing yours cannot change anyone else's. */
+setUserCreatedHook(async user => {
+  const out = await tenantsLib.seedUser(user.id, {
+    profiles: config.profiles, symbols: SYMBOLS, groups: GROUPS,
+  });
+  tenantsLib.invalidate();
+  if (out.seeded) console.log(`[accounts] seeded ${user.email}: ${out.symbols} symbols, ${out.groups} groups`);
+});
+
 app.use(authRouter());
+
+/* Default deny.
+   Everything past this point needs a session once accounts are on. An allowlist
+   of genuinely public paths is auditable in one screen; the alternative is
+   adding `requireAuth` to fifty-eight routes and being wrong about one of them —
+   and the one you are wrong about is the one that serves somebody's positions.
+   New routes are protected by default, which is the property that matters as
+   this file keeps growing. */
+const PUBLIC_PATHS = new Set([
+  "/health",          // liveness, and it reveals no user data
+  "/auth/config", "/auth/me", "/auth/login", "/auth/signup", "/auth/logout",
+]);
+app.use((req, res, next) => {
+  if (!db.enabled) return next();                  // single-user instance
+  if (PUBLIC_PATHS.has(req.path)) return next();
+  if (req.method === "OPTIONS") return next();     // CORS preflight carries no data
+  return requireAuth(req, res, next);
+});
 
 app.get("/health", async (_, res) =>
   res.json({ ok: true, provider: PROVIDER, lastRefresh: snapshot.at, symbols: snapshot.data.length,
@@ -1306,20 +1454,87 @@ app.post("/storage/flush", async (req, res) => {
   catch (e) { res.status(502).json({ ok: false, error: e.message }); }
 });
 
-app.get("/snapshot", (_, res) =>
+/* One user's view of the shared snapshot: their symbols, evaluated against their
+   criteria. Cached per user per snapshot — evaluating 500 symbols across four
+   profiles on every poll would burn the instance, and the inputs cannot change
+   between two reads of the same snapshot unless the criteria do, which bumps the
+   key. */
+const viewCache = new Map();
+
+function viewFor(tenant) {
+  if (tenant.legacy) return snapshot.data;
+  const key = `${tenant.id}:${snapshot.at}:${tenant.profilesVersion ?? JSON.stringify(Object.keys(tenant.profiles || {}))}`;
+  const hit = viewCache.get(key);
+  if (hit) return hit;
+  if (viewCache.size > 40) viewCache.clear();
+
+  const active = enabledProfiles(tenant.profiles || {});
+  const rows = snapshot.data
+    .filter(s => tenant.symbols.has(s.symbol))
+    /* A COPY per user. Annotating the shared row would mean the last reader's
+       criteria overwrite everyone else's, and two people polling at once would
+       see each other's verdicts on their own screens. */
+    .map(s => {
+      const row = { ...s };
+      const results = {};
+      for (const [id, profile] of active) {
+        const ev = evaluate(s, profile.criteria, { requireAll: !!profile.requireAll });
+        results[id] = {
+          locked: ev.locked, count: ev.count, total: ev.total,
+          lockQuality: ev.lockQuality, lockedOn: ev.lockedOn,
+          notEvaluated: ev.notEvaluated, criteria: ev.criteria,
+          withheldForMissingData: !!ev.withheldForMissingData,
+          requireAll: !!ev.requireAll,
+          warnings: ev.warnings, warningsDetail: ev.warningsDetail,
+        };
+      }
+      row.profileResults = results;
+      row.profilesLocked = Object.entries(results).filter(([, r]) => r.locked).map(([id]) => id);
+      row.decisions = {};
+      for (const [id, profile] of active) {
+        const d = decisionSummary(s, profile, results[id]);
+        if (d) row.decisions[id] = d;
+      }
+      return row;
+    });
+  viewCache.set(key, rows);
+  return rows;
+}
+
+/** The tenant for the current request — the signed-in user, or the legacy one. */
+async function tenantOf(req) {
+  if (!db.enabled) {
+    return tenantsLib.legacyTenant({
+      profiles: config.profiles, symbols: null, groups: GROUPS,
+      telegram: config.alerts?.telegram, alertsOn: !!config.alerts?.telegram?.on,
+    });
+  }
+  if (!req.user) return null;
+  const list = await tenantsLib.tenants();
+  return list.find(t => String(t.id) === String(req.user.id)) || null;
+}
+
+app.get("/snapshot", requireAuth, async (req, res) => {
+  const t = await tenantOf(req);
+  if (!t) return res.status(401).json({ error: "Sign in to continue.", authRequired: true });
   res.json({
     asOf: snapshot.at, provider: PROVIDER, delayed: FEED_DELAYED,
     dataAge: dataAge(),
     /* Render this instead of an empty state. "Nothing matched" and "nothing has
        been scanned yet" are different facts and only one of them is about the
        market. */
-    scan: scanState(),
+    scan: scanState(t),
     // The candle series is for server-side analysis only; shipping 250 bars per
     // symbol to the browser every few seconds would be pure weight.
-    data: snapshot.data.map(({ candles, intradayBars, ...rest }) => rest),
-  }));
+    data: viewFor(t).map(({ candles, intradayBars, ...rest }) => rest),
+  });
+});
 
-app.get("/signals", (_, res) => res.json(signalLog));
+app.get("/signals", requireAuth, async (req, res) => {
+  const t = await tenantOf(req);
+  if (!t) return res.status(401).json({ error: "Sign in to continue.", authRequired: true });
+  res.json(tailFor(t));
+});
 
 /* The /universe routes predate watchlists and stay pointed at the Default
    group, so anything that spoke the flat shape keeps working unchanged. They
@@ -1327,21 +1542,57 @@ app.get("/signals", (_, res) => res.json(signalLog));
 const group = name => (GROUPS[name] ||= []);
 const universeResponse = () => ({ symbols: SYMBOLS, groups: groupCounts(GROUPS) });
 
-app.get("/universe", (_, res) => res.json(universeResponse()));
+/* Per user once accounts are on. The global GROUPS object is the single-user
+   universe and stays exactly that; a signed-in account reads and writes its own
+   rows. `mine()` is the only way a handler gets a user id, so a handler that
+   forgets to scope simply has no id to use. */
+const mine = req => (db.enabled ? req.user?.id : null);
+
+async function universeResponseFor(req) {
+  const uid = mine(req);
+  if (uid == null) return universeResponse();
+  const groups = await ud.universe.groups(uid);
+  const symbols = [...new Set(Object.values(groups).flat())];
+  return { symbols, groups: Object.fromEntries(Object.entries(groups).map(([k, v]) => [k, v.length])) };
+}
+
+app.get("/universe", async (req, res) => res.json(await universeResponseFor(req)));
 
 // Replace the whole list. An empty array is legal — that is "Clear all".
-app.post("/universe", (req, res) => {
+app.post("/universe", async (req, res) => {
   if (!Array.isArray(req.body?.symbols)) return res.status(400).json({ error: "symbols must be an array" });
+  const uid = mine(req);
+  const wanted = cleanSymbols(req.body.symbols);
+  if (uid != null) {
+    if (wanted.length > MAX_SYMBOLS) return res.status(400).json({ error: `universe is full (max ${MAX_SYMBOLS})` });
+    const before = new Set(await ud.universe.symbols(uid));
+    await ud.universe.dropGroup(uid, DEFAULT_GROUP);
+    await ud.universe.add(uid, DEFAULT_GROUP, wanted);
+    tenantsLib.invalidate();
+    ensureFundamentals(wanted.filter(x => !before.has(x)));
+    return res.json(await universeResponseFor(req));
+  }
   const before = new Set(SYMBOLS);
-  GROUPS[DEFAULT_GROUP] = cleanSymbols(req.body.symbols);
+  GROUPS[DEFAULT_GROUP] = wanted;
   commitGroups(); // not awaited — the caller gets the list now, quotes land next tick
   ensureFundamentals(SYMBOLS.filter(s => !before.has(s)));
   res.json(universeResponse());
 });
 
-app.post("/universe/add", (req, res) => {
+app.post("/universe/add", async (req, res) => {
   const [symbol] = cleanSymbols([req.body?.symbol]);
   if (!symbol) return res.status(400).json({ error: "invalid symbol" });
+  const uid = mine(req);
+  if (uid != null) {
+    const have = await ud.universe.symbols(uid);
+    if (!have.includes(symbol)) {
+      if (have.length >= MAX_SYMBOLS) return res.status(400).json({ error: `universe is full (max ${MAX_SYMBOLS})` });
+      await ud.universe.add(uid, DEFAULT_GROUP, [symbol]);
+      tenantsLib.invalidate();
+      ensureFundamentals([symbol]);
+    }
+    return res.json(await universeResponseFor(req));
+  }
   if (!SYMBOLS.includes(symbol)) {
     if (SYMBOLS.length >= MAX_SYMBOLS) return res.status(400).json({ error: `universe is full (max ${MAX_SYMBOLS})` });
     group(DEFAULT_GROUP).push(symbol);
@@ -1351,9 +1602,16 @@ app.post("/universe/add", (req, res) => {
   res.json(universeResponse());
 });
 
-app.post("/universe/remove", (req, res) => {
+app.post("/universe/remove", async (req, res) => {
   const [symbol] = cleanSymbols([req.body?.symbol]);
   if (!symbol) return res.status(400).json({ error: "invalid symbol" });
+  const uid = mine(req);
+  if (uid != null) {
+    // Removed from every group of THIS user, and nobody else's.
+    await ud.universe.remove(uid, [symbol]);
+    tenantsLib.invalidate();
+    return res.json(await universeResponseFor(req));
+  }
   // Removing from "the universe" means removing it everywhere — a symbol left
   // in another group would keep being scanned and look like it never left.
   for (const name of Object.keys(GROUPS)) GROUPS[name] = GROUPS[name].filter(s => s !== symbol);
@@ -1543,17 +1801,83 @@ app.post("/watchlists/:name/move", (req, res) => {
   res.json({ groups: GROUPS, counts: groupCounts(GROUPS), moved: move.length });
 });
 
+/* ── per-user settings ───────────────────────────────────────────────────
+   Telegram credentials belong to a person, not to the instance. The single-user
+   app read one token and one chat id from the environment, which with several
+   accounts would send everyone's signals to whoever's chat id was in the env. */
+
+app.get("/me/prefs", async (req, res) => {
+  const uid = mine(req);
+  if (uid == null) {
+    return res.json({
+      mode: "single-user",
+      telegram: {
+        configured: !!(config.alerts?.telegram?.token && config.alerts?.telegram?.chatId),
+        source: "env-or-config",
+      },
+      note: "This instance has no accounts, so alerts use the shared configuration.",
+    });
+  }
+  res.json({ mode: "multi-user", ...(await ud.prefs.publicGet(uid)) });
+});
+
+app.post("/me/prefs", async (req, res) => {
+  const uid = mine(req);
+  if (uid == null) return res.status(501).json({ error: "This instance has no accounts; use /config." });
+  const { telegramToken, telegramChatId, alertsOn, alertProfiles } = req.body || {};
+  const out = await ud.prefs.put(uid, { telegramToken, telegramChatId, alertsOn, alertProfiles });
+  tenantsLib.invalidate();
+  /* Masked on the way back out. Echoing what was just saved is the ordinary way
+     a settings page leaks a bot token to anyone holding a session. */
+  res.json(out);
+});
+
+/** Send a test message, so "configured" can be checked rather than assumed. */
+app.post("/me/prefs/test", async (req, res) => {
+  const uid = mine(req);
+  if (uid == null) return res.status(501).json({ error: "This instance has no accounts; use /config." });
+  const p = await ud.prefs.get(uid);
+  if (!p.telegram.token || !p.telegram.chatId) {
+    return res.status(400).json({ error: "No Telegram token and chat id saved yet." });
+  }
+  try {
+    await notifyBrief({ token: p.telegram.token, chatId: p.telegram.chatId },
+      "👁 <b>Trinetra</b> — test message. Alerts for this account will arrive here.");
+    res.json({ ok: true, note: "Sent. If nothing arrived, the chat id is wrong or the bot was never started in that chat." });
+  } catch (e) {
+    // Telegram's own message is the useful one — it distinguishes a bad token
+    // from a chat the bot was never added to.
+    res.status(502).json({ error: "Telegram rejected the message.", detail: e.message });
+  }
+});
+
 /* ── track record ────────────────────────────────────────────────────────
    Signals, what happened next, and whether the user's picking beat the raw
    system. The numbers are reported as they are; nothing here is smoothed. */
 
-app.get("/signals/history", (req, res) =>
-  res.json({ signals: history.list({ from: req.query.from, to: req.query.to }) }));
+app.get("/signals/history", async (req, res) => {
+  const uid = mine(req);
+  if (uid == null) return res.json({ signals: history.list({ from: req.query.from, to: req.query.to }) });
+  /* The legacy-levels guard runs on the way out here too. It lives in
+     history.js and is applied to rows from either store, so the brief and the
+     track record cannot reach different verdicts about the same record. */
+  const rows = await ud.signals.list(uid, { from: req.query.from, to: req.query.to });
+  res.json({ signals: rows.map(history.guardLegacyLevels) });
+});
 
-app.get("/signals/stats", (req, res) =>
-  res.json(history.stats(Math.max(1, +req.query.days || 30))));
+app.get("/signals/stats", async (req, res) => {
+  const uid = mine(req);
+  if (uid == null) return res.json(history.stats(Math.max(1, +req.query.days || 30)));
+  const days = Math.max(1, +req.query.days || 30);
+  const since = Date.now() - days * 86_400_000;
+  const rows = (await ud.signals.list(uid, {})).filter(r => (r.firedAt ?? 0) >= since);
+  res.json(history.statsOf(rows, days));
+});
 
-app.get("/paper-trades", (_, res) => res.json({ trades: paper.all() }));
+app.get("/paper-trades", async (req, res) => {
+  const uid = mine(req);
+  res.json({ trades: uid == null ? paper.all() : await ud.trades.all(uid) });
+});
 
 /* Holdings profiles are not tradeable ideas. `sell_holdings` says "trim what you
    already own" and `buyback_holdings` says "restore it" — both change the size of
@@ -1563,9 +1887,15 @@ app.get("/paper-trades", (_, res) => res.json({ trades: paper.all() }));
    the action actually belongs, rather than accepted and quietly wrong. */
 const POSITION_PROFILES = new Set(["sell_holdings", "buyback_holdings"]);
 
-app.post("/paper-trades", (req, res) => {
+app.post("/paper-trades", async (req, res) => {
   const body = req.body || {};
-  const src = body.signalId ? history.all().find(r => r.id === body.signalId) : null;
+  const uid = mine(req);
+  /* The source signal is looked up in the CALLER's history. Reading the global
+     log would let one user's signal id resolve against another's record and
+     stamp their trade with someone else's direction and profile. */
+  const src = !body.signalId ? null
+    : uid == null ? history.all().find(r => r.id === body.signalId)
+    : (await ud.signals.list(uid, {})).find(r => r.id === body.signalId);
   const srcProfile = body.profileId || src?.profileId || null;
   if (srcProfile && POSITION_PROFILES.has(srcProfile)) {
     return res.status(400).json({
@@ -1579,21 +1909,57 @@ app.post("/paper-trades", (req, res) => {
      moment the trade starts working. */
   const t = paper.open({ ...body, side: body.side || (src?.direction === "sell" ? "sell" : "buy") });
   if (!t) return res.status(400).json({ error: "symbol, entryPrice and qty are required" });
+  if (uid != null) {
+    /* Constructed by the module so its validation and defaults still apply,
+       then moved to the caller's rows. Left in the file it would be invisible to
+       the person who created it AND visible to the single-user path. */
+    paper.remove(t.id);
+    await ud.trades.put(uid, t);
+    return res.json(t);
+  }
   paper.markToMarket(Object.fromEntries(snapshot.data.map(q => [q.symbol, q.price])));
   res.json(t);
 });
 
-app.patch("/paper-trades/:id", (req, res) => {
+app.patch("/paper-trades/:id", async (req, res) => {
+  const uid = mine(req);
+  if (uid != null) {
+    const cur = await ud.trades.get(uid, req.params.id);
+    if (!cur) return res.status(404).json({ error: "no such trade" });
+    /* Round-tripped through the module so closing a trade computes P&L by the
+       same rules for everyone — including the short mirror. Recomputing it here
+       would be a second implementation of the only number that matters. */
+    paper.restore(cur);
+    const t = paper.update(cur.id, req.body || {});
+    paper.remove(cur.id);
+    await ud.trades.put(uid, t);
+    return res.json(t);
+  }
   const t = paper.update(req.params.id, req.body || {});
   if (!t) return res.status(404).json({ error: "no such trade" });
   res.json(t);
 });
 
-app.delete("/paper-trades/:id", (req, res) =>
-  paper.remove(req.params.id) ? res.json({ ok: true }) : res.status(404).json({ error: "no such trade" }));
+app.delete("/paper-trades/:id", async (req, res) => {
+  const uid = mine(req);
+  const gone = uid == null ? paper.remove(req.params.id)
+                           : await ud.trades.remove(uid, req.params.id);
+  return gone ? res.json({ ok: true }) : res.status(404).json({ error: "no such trade" });
+});
 
-app.get("/paper-trades/stats", (req, res) =>
-  res.json(paper.stats(Math.max(1, +req.query.days || 30), history.all(), Math.max(1, +req.query.horizon || 7))));
+app.get("/paper-trades/stats", async (req, res) => {
+  const days = Math.max(1, +req.query.days || 30);
+  const horizon = Math.max(1, +req.query.horizon || 7);
+  const uid = mine(req);
+  if (uid == null) return res.json(paper.stats(days, history.all(), horizon));
+  /* The user's trades measured against the user's own signals. Comparing their
+     picking to a baseline built from someone else's signal log would be a number
+     with no meaning at all. */
+  const [mineTrades, mineSignals] = await Promise.all([
+    ud.trades.all(uid), ud.signals.list(uid, {}),
+  ]);
+  res.json(paper.statsOf(mineTrades, days, mineSignals, horizon));
+});
 
 app.get("/ipo-applications", (_, res) => res.json({ applications: ipo.all() }));
 
@@ -1643,7 +2009,7 @@ app.post("/criteria/restore-defaults", (req, res) => {
   const p = config.profiles[id];
   if (!p) return res.status(404).json({ error: "no such profile" });
   p.criteria = structuredClone(CANONICAL_CRITERIA);
-  saveConfig(); scan();
+  saveConfig(); scan().catch(e => console.error("[scan]", e.message));
   res.json({ ok: true, profile: id, criteria: p.criteria, matchesCanonical: true,
              originalFour: originalFourStatus(p.criteria, PROVIDER) });
 });
@@ -1656,7 +2022,7 @@ app.post("/criteria/restore-original-four", (req, res) => {
   const p = config.profiles[id];
   if (!p) return res.status(404).json({ error: "no such profile" });
   p.criteria = structuredClone(CANONICAL_CRITERIA);
-  saveConfig(); scan();
+  saveConfig(); scan().catch(e => console.error("[scan]", e.message));
   res.json({
     ok: true, profile: id, criteria: p.criteria, matchesCanonical: true,
     originalFour: originalFourStatus(p.criteria, PROVIDER),
@@ -1675,7 +2041,7 @@ app.post("/profiles", (req, res) => {
     alerts: req.body?.alerts || { telegram: true },
     criteria: Array.isArray(req.body?.criteria) ? req.body.criteria : [],
   };
-  saveConfig(); scan();
+  saveConfig(); scan().catch(e => console.error("[scan]", e.message));
   res.json({ profiles: config.profiles });
 });
 
@@ -1691,7 +2057,7 @@ app.patch("/profiles/:id", (req, res) => {
   if (req.body?.requireAll !== undefined) p.requireAll = !!req.body.requireAll;
   if (req.body?.alerts) p.alerts = { ...p.alerts, ...req.body.alerts };
   if (Array.isArray(req.body?.criteria)) p.criteria = req.body.criteria;
-  saveConfig(); scan();
+  saveConfig(); scan().catch(e => console.error("[scan]", e.message));
   res.json({ profiles: config.profiles });
 });
 
@@ -1700,7 +2066,7 @@ app.delete("/profiles/:id", (req, res) => {
   if (!config.profiles[id]) return res.status(404).json({ error: "no such profile" });
   if (Object.keys(config.profiles).length === 1) return res.status(400).json({ error: "cannot delete the last profile" });
   delete config.profiles[id];
-  saveConfig(); scan();
+  saveConfig(); scan().catch(e => console.error("[scan]", e.message));
   res.json({ profiles: config.profiles });
 });
 
@@ -1708,10 +2074,15 @@ app.delete("/profiles/:id", (req, res) => {
 
 const stockBySymbol = () => Object.fromEntries(snapshot.data.map(q => [q.symbol, q]));
 
-app.get("/holdings", (_, res) => {
+/* Holdings are the clearest case for isolation: a friend seeing this list sees
+   what you own, at what price, and how it is doing. There is no read path here
+   that is not scoped by user id. */
+app.get("/holdings", async (req, res) => {
   const by = stockBySymbol();
+  const uid = mine(req);
+  const rows = uid == null ? holdings.all() : await ud.holdings.all(uid);
   res.json({
-    holdings: holdings.all().map(h => ({
+    holdings: rows.map(h => ({
       ...h,
       cycle: cycle.derive(h, by[h.symbol]?.price ?? h.entryPrice),
       holdingPeriod: cycle.holdingPeriod(h),
@@ -1719,30 +2090,54 @@ app.get("/holdings", (_, res) => {
   });
 });
 
-app.post("/holdings", (req, res) => {
+app.post("/holdings", async (req, res) => {
   // One tap: { symbol } is enough. Entry price, the thesis and the levels the
   // exit rules need are all captured from the current snapshot.
   const sym = String(req.body?.symbol ?? "").trim().toUpperCase();
   const stock = stockBySymbol()[sym];
   const profileId = req.body?.profileId || "swing";
-  const p = config.profiles[profileId];
+  const uid = mine(req);
+  const profiles = uid == null ? config.profiles : ((await tenantOf(req))?.profiles || {});
+  const p = profiles[profileId];
   const ev = stock && p ? evaluate(stock, p.criteria, { requireAll: !!p.requireAll }) : null;
+  /* Built by the same constructor either way, then written to the store that
+     belongs to the caller. `holdings.add` also appends to the legacy file, so
+     for an account the row is removed from there again — otherwise the
+     single-user file slowly accumulates every user's positions. */
   const h = holdings.add({ ...req.body, profileId }, stock, ev);
   if (!h) return res.status(400).json({ error: "symbol required, and it must be in the watchlist or carry an entryPrice" });
+  if (uid != null) {
+    holdings.remove(h.id);
+    await ud.holdings.put(uid, h);
+    return res.json(h);
+  }
   holdings.markToMarket(stockBySymbol());
   scanExits();
   res.json(h);
 });
 
-app.patch("/holdings/:id", (req, res) => {
+app.patch("/holdings/:id", async (req, res) => {
+  const uid = mine(req);
+  if (uid != null) {
+    const cur = await ud.holdings.get(uid, req.params.id);
+    if (!cur) return res.status(404).json({ error: "no such holding" });
+    // Merged here rather than in SQL so the module's own field rules still apply.
+    const merged = { ...cur, ...(req.body || {}), id: cur.id };
+    await ud.holdings.put(uid, merged);
+    return res.json(merged);
+  }
   const h = holdings.update(req.params.id, req.body || {});
   if (!h) return res.status(404).json({ error: "no such holding" });
   scanExits();
   res.json(h);
 });
 
-app.delete("/holdings/:id", (req, res) =>
-  holdings.remove(req.params.id) ? res.json({ ok: true }) : res.status(404).json({ error: "no such holding" }));
+app.delete("/holdings/:id", async (req, res) => {
+  const uid = mine(req);
+  const gone = uid == null ? holdings.remove(req.params.id)
+                           : await ud.holdings.remove(uid, req.params.id);
+  return gone ? res.json({ ok: true }) : res.status(404).json({ error: "no such holding" });
+});
 
 /* `signals` is fired-only. Armed-but-unfired rules are a separate array, so a
    "trailing stop 1.2% away" can never be rendered with the same affordances as
@@ -1851,7 +2246,7 @@ app.post("/profiles/:id/criteria", (req, res) => {
   if (!p) return res.status(404).json({ error: "no such profile" });
   if (!Array.isArray(req.body?.criteria)) return res.status(400).json({ error: "criteria must be an array" });
   p.criteria = req.body.criteria;
-  saveConfig(); scan();
+  saveConfig(); scan().catch(e => console.error("[scan]", e.message));
   res.json({ profiles: config.profiles });
 });
 
@@ -2505,7 +2900,7 @@ app.post("/config", (req, res) => {
     };
   }
   saveConfig();
-  scan(); // re-evaluate immediately against the new rules
+  scan().catch(e => console.error("[scan]", e.message)); // re-evaluate immediately against the new rules
   res.json({ ok: true, config: publicConfig() });
 });
 
@@ -2548,6 +2943,44 @@ app.listen(PORT, async () => {
         console.log("[accounts] no accounts yet — the FIRST signup becomes the owner and needs no invite code. Create it now, before the URL is shared.");
       }
       setInterval(() => db.sweep(), 6 * 3600_000).unref?.();
+
+      /* The owner's existing data moves into their account, once.
+         Without this the person who has been running this instance signs in and
+         finds their holdings, trade record and criteria gone — still on disk,
+         invisible in the app. Nothing is deleted: this reads the files and
+         writes rows, so a bad import can be retried from the original.
+         Guarded on the target being empty, so a redeploy cannot duplicate a
+         trade log. */
+      const owners = await db.query(
+        "SELECT id, email FROM users WHERE is_admin = true ORDER BY id LIMIT 1");
+      const owner = owners.rows[0];
+      if (owner) {
+        const rep = await tenantsLib.migrateLegacy(owner.id, {
+          profiles: config.profiles,
+          groups: GROUPS,
+          holdings: holdings.all(),
+          trades: paper.all(),
+          history: history.all(),
+        }).catch(e => { console.error(`[accounts] legacy import failed: ${e.message}`); return null; });
+        if (rep) {
+          const moved = rep.config || rep.symbols || rep.holdings || rep.trades || rep.signals;
+          if (moved) {
+            console.log(`[accounts] imported into ${owner.email}: ${rep.symbols} symbols, ${rep.holdings} holdings, ${rep.trades} paper trades, ${rep.signals} signal records, ${rep.config} profiles. The files in data/ are untouched.`);
+          }
+          for (const why of rep.skipped) console.log(`[accounts] not imported — ${why}`);
+        }
+      }
+
+      /* Any account with no criteria gets the shipped defaults. An empty
+         dashboard reads as broken rather than as new, and a friend's first
+         impression should not be a blank screen. */
+      for (const u of await ud.activeUsers()) {
+        const seeded = await tenantsLib.seedUser(u.id, {
+          profiles: config.profiles, symbols: SYMBOLS, groups: GROUPS,
+        }).catch(e => { console.warn(`[accounts] seed for ${u.email} failed: ${e.message}`); return null; });
+        if (seeded?.seeded) console.log(`[accounts] seeded ${u.email} with ${seeded.symbols} symbols and the default criteria`);
+      }
+      tenantsLib.invalidate();
     } catch (e) {
       console.error(`[accounts] DATABASE_URL is set but the schema could not be applied: ${e.message}`);
       console.error("[accounts] every authenticated route will return 503 until this is fixed. The instance is NOT open — it is closed.");

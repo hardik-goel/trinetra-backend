@@ -15,6 +15,8 @@
    ================================================================ */
 import express from "express";
 import cors from "cors";
+import * as db from "./lib/db.js";
+import { attachUser, csrfGuard, authRouter, requireAuth, requireAdmin } from "./lib/authRoutes.js";
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
@@ -1181,20 +1183,40 @@ const UI_ORIGIN = (process.env.UI_ORIGIN || "*").trim();
 const corsOrigin = UI_ORIGIN === "*"
   ? "*"
   : UI_ORIGIN.split(",").map(o => o.trim()).filter(Boolean);
-app.use(cors({ origin: corsOrigin }));
+
+/* `credentials` is what lets the session cookie cross from the dashboard origin
+   to this one, and the browser refuses that combination with `origin: "*"` —
+   a wildcard plus credentials is rejected outright, not merely discouraged. So
+   with accounts enabled, UI_ORIGIN must name the dashboard. Failing loudly at
+   boot beats a login that silently never persists: the request succeeds, the
+   Set-Cookie is dropped, and the next call is anonymous with no error anywhere. */
+if (db.enabled && UI_ORIGIN === "*") {
+  throw new Error(
+    "UI_ORIGIN must name your dashboard origin (e.g. https://trinetra.vercel.app) when DATABASE_URL is set. " +
+    "Browsers reject credentialed requests against a wildcard origin, so sign-in cookies would be silently discarded.");
+}
+app.use(cors({ origin: corsOrigin, credentials: db.enabled, exposedHeaders: ["x-csrf-token"] }));
 console.log(`[cors] ${UI_ORIGIN === "*"
   ? "open to any origin — set UI_ORIGIN to your dashboard origin in production"
-  : "restricted to " + [].concat(corsOrigin).join(", ")}`);
+  : "restricted to " + [].concat(corsOrigin).join(", ")}${db.enabled ? " · credentials allowed (accounts enabled)" : ""}`);
 app.use(express.json());
+app.use(attachUser);
+app.use(csrfGuard);
+app.use(authRouter());
 
-app.get("/health", (_, res) =>
+app.get("/health", async (_, res) =>
   res.json({ ok: true, provider: PROVIDER, lastRefresh: snapshot.at, symbols: snapshot.data.length,
              delayed: PROVIDER === "yahooDelayed",
              // Whether this instance's data survives a redeploy. Surfaced here
              // because "ephemeral" is a thing to be told, not to discover — but
              // without the repo name or raw API errors, which are not public.
              scan: scanState(),
-             storage: remote.publicStatus() }));
+             storage: remote.publicStatus(),
+             /* Whether accounts are on. Stated because `requireAuth` passes
+                through in single-user mode: an instance can look protected in
+                the source and be wide open in production, and the only honest
+                place to settle that is the health endpoint. */
+             accounts: await db.status() }));
 
 /* A real signal payload for a screener profile, before one has fired.
 
@@ -2487,9 +2509,52 @@ app.post("/config", (req, res) => {
   res.json({ ok: true, config: publicConfig() });
 });
 
+/* Terminal error handler. Must be registered after every route — Express picks
+   the four-argument middleware, and only one that comes last sees everything.
+   Without it a rejected handler reaches Node's default unhandled-rejection
+   behaviour, which is to exit: one slow database call becomes a crash and a cold
+   start for everybody. The message is logged in full and NOT returned; a stack
+   trace or a driver error can carry table names and connection details. */
+app.use((err, req, res, _next) => {
+  console.error(`[error] ${req.method} ${req.path}: ${err?.stack || err?.message || err}`);
+  if (res.headersSent) return;
+  res.status(500).json({ error: "Something went wrong handling that request." });
+});
+
+/* Last resort. Anything that escapes the handler above — a rejection thrown from
+   a timer or a background scan — is logged instead of taking the process with
+   it. The scan loop and the alert loop both run outside any request. */
+process.on("unhandledRejection", e =>
+  console.error(`[unhandled] ${e?.stack || e?.message || e}`));
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`[trinetra] listening :${PORT} · provider=${PROVIDER}`);
+
+  /* Accounts, before anything serves. The schema is idempotent, so this is a
+     no-op on every boot after the first.
+
+     A failure here does NOT kill the process: the market side of the app is
+     independent of the database, and taking the whole instance down because
+     Postgres was slow to wake would be a worse outcome than serving reads.
+     But it must be loud, and `requireAuth` returns 503 rather than passing
+     through while `db.enabled` is true and the schema is not ready — an auth
+     layer that opens when its store is unreachable is not an auth layer. */
+  if (db.enabled) {
+    try {
+      const m = await db.migrate();
+      console.log(`[accounts] multi-user mode · schema ready · ${m.users} account${m.users === 1 ? "" : "s"}`);
+      if (m.users === 0) {
+        console.log("[accounts] no accounts yet — the FIRST signup becomes the owner and needs no invite code. Create it now, before the URL is shared.");
+      }
+      setInterval(() => db.sweep(), 6 * 3600_000).unref?.();
+    } catch (e) {
+      console.error(`[accounts] DATABASE_URL is set but the schema could not be applied: ${e.message}`);
+      console.error("[accounts] every authenticated route will return 503 until this is fixed. The instance is NOT open — it is closed.");
+    }
+  } else {
+    console.log("[accounts] single-user mode — no DATABASE_URL. Every request is treated as the owner; do not put this URL anywhere public.");
+  }
 
   /* Pull anything this disk is missing BEFORE the first scan. On Render's free
      plan a redeploy arrives with an empty data/, so this is the step that turns

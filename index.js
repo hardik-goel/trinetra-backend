@@ -510,8 +510,14 @@ function decisionSummary(stock, profile, result) {
     confidence: conf ? { score: conf.score, band: conf.band, capped: (conf.caps || []).length > 0 } : null,
     // null rather than 0 when there is no estimate: "no view" and "no upside
     // left" are different claims and must sort differently.
-    remainingMedianPct: pot?.remainingPct?.median ?? null,
+    /* Null when the target was rejected. "est. 4% left" beside a target the
+       engine refused to offer is the watchlist contradicting the detail view,
+       and the watchlist is the one most people read. The percentage still exists
+       on `potential` for anyone who wants the raw estimate; what it must not do
+       is stand in a column that means "upside available". */
+    remainingMedianPct: exits?.noRoom ? null : (pot?.remainingPct?.median ?? null),
     rrToPrimary: exits?.riskReward?.toPrimary ?? null,
+    noRoom: !!exits?.noRoom,
     exhausted: !!pot?.exhausted,
     insufficientHistory: !!pot?.insufficientHistory,
     noEstimate: pot === null,
@@ -782,6 +788,7 @@ function scan() {
         potential: pot, confidence: conf, exits: levels, dataAge: age,
         entryPrice: entry.entryPrice, exitPrice: entry.exitPrice,
         stopPrice: entry.stopPrice, levelSource,
+        noRoom: entry.noRoom, riskRewardWarning: entry.riskRewardWarning,
       });
       entry.id = rec.id;
 
@@ -1241,6 +1248,7 @@ app.get("/signals/preview", (req, res) => {
          and still be a bad bet on geometry alone — and on a short the losing side
          has no floor, so sub-1:1 matters more here than anywhere else. */
       riskRewardWarning: pb?.exits?.riskRewardWarning ?? null,
+      noRoom: !!pb?.exits?.noRoom,
       confidence: pb?.exits?.confidence ? { score: pb.exits.confidence.score, band: pb.exits.confidence.band } : null,
       ...(isSell ? {
         shortability: sh,
@@ -1518,8 +1526,29 @@ app.get("/signals/stats", (req, res) =>
 
 app.get("/paper-trades", (_, res) => res.json({ trades: paper.all() }));
 
+/* Holdings profiles are not tradeable ideas. `sell_holdings` says "trim what you
+   already own" and `buyback_holdings` says "restore it" — both change the size of
+   an existing position, neither opens a new one. Recording either as a paper
+   trade invents a position the user never took and then scores them on it, which
+   corrupts the only thing this module exists to measure. Rejected with the place
+   the action actually belongs, rather than accepted and quietly wrong. */
+const POSITION_PROFILES = new Set(["sell_holdings", "buyback_holdings"]);
+
 app.post("/paper-trades", (req, res) => {
-  const t = paper.open(req.body || {});
+  const body = req.body || {};
+  const src = body.signalId ? history.all().find(r => r.id === body.signalId) : null;
+  const srcProfile = body.profileId || src?.profileId || null;
+  if (srcProfile && POSITION_PROFILES.has(srcProfile)) {
+    return res.status(400).json({
+      error: `${srcProfile} signals adjust a holding you already own — they do not open a new position, so they cannot be recorded as a paper trade.`,
+      instead: "PATCH /holdings/:id to change the quantity held, or close the holding.",
+      profileId: srcProfile,
+    });
+  }
+  /* Direction is read from the signal, never defaulted. A sell signal recorded
+     as a long is a P&L that runs backwards and a stop that reads as hit the
+     moment the trade starts working. */
+  const t = paper.open({ ...body, side: body.side || (src?.direction === "sell" ? "sell" : "buy") });
   if (!t) return res.status(400).json({ error: "symbol, entryPrice and qty are required" });
   paper.markToMarket(Object.fromEntries(snapshot.data.map(q => [q.symbol, q.price])));
   res.json(t);
@@ -1977,6 +2006,12 @@ app.get("/playbook/all", (req, res) => {
          shape against the other finds null and assumes it is missing. */
       riskReward: pb.exits.riskReward ?? null,
       riskRewardWarning: pb.exits.riskRewardWarning ?? null,
+      /* Hoisted with them. A row carrying `primary: null` plus a warning made the
+         caller infer the rejection from the fact that a warning can only exist
+         once a ratio was computed — correct reasoning, and exactly the kind of
+         inference this contract exists to remove. The conclusion ships as a
+         field on every shape that can express it. */
+      noRoom: !!pb.exits.noRoom,
       exits: {
         primary: pb.exits.primary
           ? { zone: pb.exits.primary.zone, pct: pb.exits.primary.pct,
@@ -1987,6 +2022,7 @@ app.get("/playbook/all", (req, res) => {
         // Belongs in the compact row too: sub-1:1 is exactly the row a fast
         // scan of a table should not skip past.
         riskRewardWarning: pb.exits.riskRewardWarning,
+        noRoom: !!pb.exits.noRoom,
         confidence: { score: pb.exits.confidence.score, band: pb.exits.confidence.band },
       },
       potential: pb.potential,

@@ -163,10 +163,23 @@ token still works exactly as before.
 | GET | `/signals/history?from=&to=` | `{signals: [...]}` with outcomes |
 | GET | `/signals/stats?days=` | aggregates, per horizon and per criteria combination |
 | GET | `/paper-trades` | `{trades: [...]}` open trades carry `mtm` |
-| POST | `/paper-trades` | `{symbol, entryPrice, qty, signalId?, stopLoss?, target?, notes?}` |
+| POST | `/paper-trades` | `{symbol, entryPrice, qty, signalId?, side?, stopLoss?, target?, notes?}` |
 | PATCH | `/paper-trades/:id` | update, or close with `{status:"closed", exitPrice, exitReason}` |
 | DELETE | `/paper-trades/:id` | |
 | GET | `/paper-trades/stats?days=&horizon=` | win rate, expectancy, profit factor, selection edge |
+
+**A paper trade has a direction.** `side` is `"buy"` or `"sell"`, taken from the
+signal when `signalId` is given and defaulted only in its absence. It was
+hardcoded to `"buy"`, so taking a SELL signal recorded a long: P&L ran backwards
+and a short that was working read as a loss. Realised P&L, MTM, `stopHit` and
+`targetHit` all mirror on it — a short's stop is **above** its entry, so an
+unmirrored `stopHit` fires the moment the trade starts working.
+
+**`sell_holdings` and `buyback_holdings` signals are rejected with 400.** They
+adjust a position the user already holds rather than opening one; recording either
+as a paper trade invents a position that was never taken and then scores the user
+on it. The response names `PATCH /holdings/:id` as where the action belongs. Do
+not offer "I took this" on those cards.
 | GET/POST | `/ipo-applications` | |
 | PATCH/DELETE | `/ipo-applications/:id` | |
 | GET | `/ipo-applications/stats?days=` | allotment rate, listing gains, what you skipped |
@@ -278,6 +291,16 @@ the 75th percentile and then clamped the median and 25th down to it, one nearby
 pivot collapsed all three onto itself — a 3.4% median swing outcome became a 1.1%
 target against a 4.6% stop. `resistance` is still reported and named in the
 rationale; it informs the reader and no longer rewrites the estimate.
+
+**`noRoom` ships on every shape that can express it** — the full payload, the
+compact `/playbook/all` row, the `decisions` summary on snapshot rows, signals,
+and the stored history record. A caller must never infer it from
+`primary: null` plus a non-null `riskRewardWarning`; that inference happens to be
+sound today only because a warning requires a computed ratio, and a contract you
+can only satisfy by reasoning about how the producer works is not a contract.
+On snapshot `decisions`, `remainingMedianPct` is **null when `noRoom`** — a
+watchlist column reading "est. 4% left" beside a target the engine refused to
+offer is the summary contradicting the detail.
 
 **`noRoom: true` means a target was computed and rejected**, not that none could
 be found. `safe`, `primary` and `stretch` are `null`; `stop` and `riskReward`
@@ -742,6 +765,15 @@ schema — feature-detect on `schemaVersion >= 2`, never `=== 2`.
   fall back to showing the raw number.
 - A buy's target is always above its entry and its stop below it; a sell's the
   mirror. Enforced at the boundary — an inverted level never leaves the process.
+
+**The stored history record keeps the reason, not just the absence.**
+`levels: { entry, exit, stop, source, noRoom, riskRewardWarning }`. A rejected
+target and a record written before the field existed both store `exit: null`, and
+nothing downstream can tell them apart after the fact — so the reason is written
+at fire time or it is gone. **`noRoom` absent (not `false`) means the record
+predates the field**; do not read that as "a target was offered". Reading
+entry-and-stop-with-no-exit as "no target sent" is a guess about a shape, not a
+fact about the signal.
 
 ---
 

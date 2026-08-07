@@ -727,7 +727,14 @@ function scan() {
            another one — a stock failing a breakout test is not thereby breaking
            down. */
         direction: profile.direction === "sell" ? "sell" : "buy",
-        entryPrice: pot?.triggerPrice ?? pbFallback?.entry?.zone?.high ?? null,
+        /* The basis, not the trigger. JBMA printed "Entry ₹653" — the level the
+           setup crossed — while every percentage beside it was measured from spot
+           ₹656.90, so the stop shown as 3.29% away was 2.71% away from the entry
+           shown. Two prices in one alert, and the R:R belonged to neither. The
+           entry is where the trade actually starts; `triggerPrice` remains in the
+           payload as the level that fired it. */
+        entryPrice: pot?.basisPrice ?? pbFallback?.entry?.zone?.high ?? null,
+        triggerPrice: pot?.triggerPrice ?? null,
         exitPrice: levels?.primary?.price ?? null,
         potentialLeftPct: levels?.primary?.pct ?? null,
         stopPrice: levels?.stop?.price ?? null,

@@ -312,6 +312,26 @@ level source on `noRoom`** — it is a conclusion, and replacing it with a numbe
 from elsewhere destroys the finding. Both the analog and the structure path set
 it, and both mean the same thing.
 
+
+**`entryPrice` is the basis, not the trigger.** JBMA shipped "Entry ₹653" with a
+stop shown as 3.29% away — but 3.29% was measured from spot ₹656.90, so the stop
+was 2.71% from the entry printed beside it. Two prices in one alert and the R:R
+belonged to neither. `entryPrice` is now `potential.basisPrice`; `triggerPrice`
+stays in the payload as the level that fired the setup.
+
+**The stop is sized on the horizon it is protecting.** It was
+`max(1.5 × daily ATR, |median MAE|)` for every profile while the target was capped
+at `1.5 × ATR × √sessions` — so on intraday, where `√1 = 1`, the target ceiling was
+exactly the stop floor and NO intraday signal could clear 1:1. Every one came out
+`noRoom`. The stop is now the median adverse excursion these setups produced over
+the same window the target is measured across, bounded by
+`[0.5, 1.5] × ATR × √sessions` and by an absolute 0.5% minimum — below that a stop
+is hit by the spread rather than by the idea failing.
+
+**Signals carry `verdict`** — one line saying what the numbers add up to, ordered
+by what disqualifies fastest: SKIP, WEAK, LATE, CAUTION, STRONG, FAIR, MARGINAL,
+UNRATED. It reasons and never instructs.
+
 **Rendering rules that are not optional:**
 - `potential` is **null for `longterm`** — a % target over years is meaningless
   and is deliberately not produced. Do not render an empty range; say the

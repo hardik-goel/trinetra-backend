@@ -61,6 +61,7 @@ import { build as buildPlaybook } from "./lib/playbook.js";
 import { fetchIndices, INDICES } from "./lib/nseIndices.js";
 import * as fno from "./lib/fno.js";
 import * as remote from "./lib/remoteStore.js";
+import { buildCorsOrigin } from "./lib/cors.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const read = f => JSON.parse(fs.readFileSync(path.join(__dirname, f), "utf8"));
@@ -1302,7 +1303,7 @@ const app = express();
 const UI_ORIGIN = (process.env.UI_ORIGIN || "*").trim();
 const corsOrigin = UI_ORIGIN === "*"
   ? "*"
-  : UI_ORIGIN.split(",").map(o => o.trim()).filter(Boolean);
+  : buildCorsOrigin(UI_ORIGIN);
 
 /* `credentials` is what lets the session cookie cross from the dashboard origin
    to this one, and the browser refuses that combination with `origin: "*"` —
@@ -1318,7 +1319,7 @@ if (db.enabled && UI_ORIGIN === "*") {
 app.use(cors({ origin: corsOrigin, credentials: db.enabled, exposedHeaders: ["x-csrf-token"] }));
 console.log(`[cors] ${UI_ORIGIN === "*"
   ? "open to any origin — set UI_ORIGIN to your dashboard origin in production"
-  : "restricted to " + [].concat(corsOrigin).join(", ")}${db.enabled ? " · credentials allowed (accounts enabled)" : ""}`);
+  : corsOrigin.describe()}${db.enabled ? " · credentials allowed (accounts enabled)" : ""}`);
 app.use(express.json());
 app.use(attachUser);
 app.use(csrfGuard);

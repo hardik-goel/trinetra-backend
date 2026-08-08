@@ -1007,8 +1007,34 @@ Left unset it defaults to `*`, and startup says so:
 
 ```
 [cors] open to any origin — set UI_ORIGIN to your dashboard origin in production
-[cors] restricted to https://trinetra-web-zeta.vercel.app
+[cors] restricted to https://trinetra-web-zeta.vercel.app, http://localhost:3000 · previews of trinetra-web-zeta, trinetra-web · any localhost port
 ```
+
+**Vercel previews pass without being listed.** Every preview deploy gets its own
+hostname — `trinetra-web-git-<branch>-<scope>.vercel.app` for a branch and
+`trinetra-web-<hash>-<scope>.vercel.app` for a specific build — and the hash does
+not exist until the build runs, so there is nothing to put in `UI_ORIGIN`. The
+project slug is derived from the `.vercel.app` entries already there and any
+origin starting with it is accepted. Deliberately not a blanket `*.vercel.app`
+rule: that would let anyone's Vercel page make credentialed requests against a
+signed-in session. Override the derivation with `UI_ORIGIN_PREVIEW_PREFIX`
+(comma-separated project slugs) when the production alias is not named after the
+project, and `UI_ORIGIN_REGEX` matches the full origin string for anything else.
+
+**One loopback entry opts in every local port.** With `http://localhost:3000` in
+the list, `http://localhost:5173` and friends work too — no need to enumerate the
+port the dashboard happened to start on. A deployed instance whose `UI_ORIGIN`
+names no loopback origin gets none of this.
+
+A blocked origin gets the response without CORS headers, not a 500, and the
+reason is logged server-side: `[cors] blocked https://… — not in UI_ORIGIN and
+not a preview of …`. Check the Render logs before assuming the backend is down.
+
+`Access-Control-Allow-Credentials: true` ships automatically once `DATABASE_URL`
+is set — it is what carries the session cookie across from Vercel, and it is off
+in single-user mode because there is no cookie to carry. The combination is
+invalid with a wildcard, so with `DATABASE_URL` set and `UI_ORIGIN=*` the server
+refuses to boot rather than serving logins whose `Set-Cookie` is silently dropped.
 
 ## Order-book depth on free feeds
 Buyers/sellers % needs paid exchange depth — no free source has it. The

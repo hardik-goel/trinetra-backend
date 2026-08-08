@@ -6,7 +6,8 @@ dashboard predates several of these.
 
 Base URL is whatever `NEXT_PUBLIC_BACKEND_URL` points at. Every route is subject
 to `UI_ORIGIN` CORS (defaults to `*`; production should name the dashboard
-origin).
+origin). Vercel preview deploys of the same project are accepted without being
+listed, so a PR build of the dashboard talks to production unchanged.
 
 ---
 

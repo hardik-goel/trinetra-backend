@@ -41,6 +41,21 @@ services:
       - key: TELEGRAM_CHAT_ID
         sync: false
 
+      # Accounts. Unset is single-user mode: every request is the owner. Set it
+      # and the schema builds on boot, the first signup becomes the owner, and
+      # the owner's on-disk data is imported into that account once. Supabase
+      # must be the SESSION POOLER string (port 5432) — the direct host is
+      # IPv6-only and Render cannot reach it. With this set, UI_ORIGIN must name
+      # a real origin: "*" refuses to boot, because browsers discard sign-in
+      # cookies against a wildcard and the login would fail silently.
+      - key: DATABASE_URL
+        sync: false
+
+      # Browser origin allowlist, comma-separated. Vercel previews of the same
+      # project and extra localhost ports are derived from it — see the README.
+      - key: UI_ORIGIN
+        sync: false
+
       # Pravesh workflow trigger. GitHub's own scheduler never fired a single
       # run, so the backend dispatches instead. Inert unless ENABLED is "true".
       # GITHUB_TOKEN must be a FINE-GRAINED PAT scoped to the pravesh-engine repo

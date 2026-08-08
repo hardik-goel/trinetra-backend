@@ -1036,6 +1036,113 @@ in single-user mode because there is no cookie to carry. The combination is
 invalid with a wildcard, so with `DATABASE_URL` set and `UI_ORIGIN=*` the server
 refuses to boot rather than serving logins whose `Set-Cookie` is silently dropped.
 
+## Turning accounts on
+
+Accounts are off until `DATABASE_URL` is set. Without it the instance runs in
+**single-user mode**: every request is treated as the owner, `requireAuth`
+passes through, and anyone with the URL has full access. That is the honest
+state of the deployment as shipped — `GET /health` → `accounts.mode` says which
+mode is live, and it is the only place that settles it, because the source looks
+protected in both.
+
+There is no migration step to run. The schema is created on boot, idempotently,
+and the owner's existing on-disk data — holdings, paper trades, criteria, the
+universe — is imported into the first admin account once, guarded on the target
+being empty so a redeploy cannot duplicate a trade log. Nothing on disk is
+deleted, so a bad import can be retried from the original files.
+
+### 1. Get a Postgres
+
+Any Postgres reachable over TLS works. Neon and Supabase are the two the
+connection handling was written against — both terminate unencrypted
+connections and both present certificates Node will not verify against its
+default CA set, which is why the pool sets `rejectUnauthorized: false`. The
+transport is still TLS; the chain is simply not pinned.
+
+**Neon** ([neon.tech](https://neon.tech)) is the path of least friction: the
+free tier does not expire, and the string it hands you works unmodified.
+Create a project, then copy the connection string from the dashboard:
+
+```
+postgresql://neondb_owner:npg_xxxxxxxx@ep-still-frost-12345678-pooler.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
+```
+
+**Supabase** works too, but take the **Session pooler** string, not the direct
+one. The direct host is IPv6-only and Render cannot reach it; the failure looks
+like `ENOTFOUND`, not like a config error:
+
+```
+postgresql://postgres.abcdefghijklmnop:YOUR_PASSWORD@aws-0-ap-south-1.pooler.supabase.com:5432/postgres
+```
+
+**Render's own Postgres** is the tightest integration — the internal URL keeps
+traffic off the public internet — but the free instance is deleted after 30
+days, taking every account with it. Fine to try accounts on, wrong to leave
+running.
+
+A local Postgres is detected by host and connects without TLS:
+
+```
+postgresql://localhost:5432/trinetra
+```
+
+### 2. Set it on Render
+
+Dashboard → the service → Environment → **Add Environment Variable**:
+
+```
+DATABASE_URL = <the string from step 1>
+```
+
+`DB_POOL_MAX` defaults to 5, which suits Render's free instance. Raise it only
+if the host's connection cap allows — a pool that exceeds the cap fails in a way
+that reads as the database being down.
+
+**Check `UI_ORIGIN` in the same visit.** Two things change once accounts are on:
+
+- `UI_ORIGIN=*` and `DATABASE_URL` together make the server **refuse to boot**.
+  Browsers reject credentialed requests against a wildcard origin, so logins
+  would succeed while their `Set-Cookie` was silently discarded — a failure with
+  no error anywhere. Failing at boot is the loud version.
+- Drop `http://localhost:3000` from the production value. Browsers treat
+  localhost as a secure context, so a `Secure` session cookie does reach it, and
+  any page served from a local port could then make credentialed calls against
+  production. Harmless in single-user mode, not after.
+
+### 3. Create the owner account, immediately
+
+Redeploy. The log states where you are:
+
+```
+[accounts] multi-user mode · schema ready · 0 accounts
+[accounts] no accounts yet — the FIRST signup becomes the owner and needs no invite code. Create it now, before the URL is shared.
+```
+
+**The first signup becomes the owner and needs no invite.** Until it exists, the
+instance is one POST away from being owned by whoever finds it. Do it before the
+URL goes anywhere:
+
+```bash
+curl -X POST https://your-backend.onrender.com/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","password":"at-least-ten-characters"}'
+```
+
+Every signup after that requires an invite code from the owner. `GET
+/auth/config` reports which state applies (`firstRun`, `inviteRequired`), so the
+dashboard knows which form to show without guessing.
+
+### 4. Confirm it took
+
+```bash
+curl -s https://your-backend.onrender.com/health | jq '.accounts, .build'
+```
+
+`accounts.mode` should read `multi-user` with `ok: true` and a `users` count.
+`accounts.ok: false` means the schema is reachable-in-config but not in fact —
+`requireAuth` returns 503 in that state rather than passing through, because an
+auth layer that opens when its store is unreachable is not an auth layer.
+
 ## Order-book depth on free feeds
 Buyers/sellers % needs paid exchange depth — no free source has it. The
 Order-flow criterion ships **disabled**; the dashboard shows NO DATA rather

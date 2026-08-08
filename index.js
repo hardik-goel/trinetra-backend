@@ -1296,6 +1296,8 @@ function scanExits(windowOpen = true) {
   }
 }
 
+const BOOT_AT = Date.now();
+
 const app = express();
 /* CORS applies to every route below, so the write endpoints (/config,
    /universe, /fundamentals) are restricted by the same rule as the reads.
@@ -1365,7 +1367,17 @@ app.get("/health", async (_, res) =>
                 through in single-user mode: an instance can look protected in
                 the source and be wide open in production, and the only honest
                 place to settle that is the health endpoint. */
-             accounts: await db.status() }));
+             accounts: await db.status(),
+             /* Which commit is actually running. Without this, "is the new
+                code live?" is answered by probing for a route and inferring —
+                and a 404 from a missing query param reads exactly like a 404
+                from a stale build. Render injects these; locally they are
+                null, which is itself the honest answer. */
+             build: {
+               commit: process.env.RENDER_GIT_COMMIT || null,
+               branch: process.env.RENDER_GIT_BRANCH || null,
+               startedAt: BOOT_AT,
+             } }));
 
 /* A real signal payload for a screener profile, before one has fired.
 

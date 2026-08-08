@@ -9,6 +9,12 @@ to `UI_ORIGIN` CORS (defaults to `*`; production should name the dashboard
 origin). Vercel preview deploys of the same project are accepted without being
 listed, so a PR build of the dashboard talks to production unchanged.
 
+**Before reporting a route as missing, check `GET /health` → `build.commit`.**
+It is the commit the running instance was built from. A 404 means either the
+route does not exist in that commit or the request was missing a required query
+param — `/playbook` without `?symbol=` 404s exactly like a stale deploy — and
+the commit is what separates the two. `build.commit` is `null` off Render.
+
 ---
 
 ## What changed most recently (read this first)
